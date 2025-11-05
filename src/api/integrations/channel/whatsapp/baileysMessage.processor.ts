@@ -19,6 +19,23 @@ export class BaileysMessageProcessor {
   }>();
 
   mount({ onMessageReceive }: MountProps) {
+
+    // Se já existe subscription, fazer cleanup primeiro
+    if (this.subscription && !this.subscription.closed) {
+      this.subscription.unsubscribe();
+    }
+
+    // Se o Subject foi completado, recriar
+    if (this.messageSubject.closed) {
+      this.processorLogs.warn('MessageSubject was closed, recreating...');
+      this.messageSubject = new Subject<{
+        messages: WAMessage[];
+        type: MessageUpsertType;
+        requestId?: string;
+        settings: any;
+      }>();
+    }
+
     this.subscription = this.messageSubject
       .pipe(
         tap(({ messages }) => {

@@ -710,6 +710,10 @@ export class BaileysStartupService extends ChannelStartupService {
       this.loadWebhook();
       this.loadProxy();
 
+      this.messageProcessor.mount({
+        onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+      });
+
       return await this.createClient(number);
     } catch (error) {
       this.logger.error(error);
