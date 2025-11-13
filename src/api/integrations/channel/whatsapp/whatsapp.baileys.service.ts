@@ -402,6 +402,12 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
+
+        this.logger.info(lastDisconnect.error);
+
+        await this.client.ws.close();
+        this.client.end(new Error('restart'));
+
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -4591,23 +4597,27 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async updateChatUnreadMessages(remoteJid: string): Promise<number> {
-    const [chat, unreadMessages] = await Promise.all([
-      this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
-      // Use raw SQL to avoid JSON path issues
-      this.prismaRepository.$queryRaw`
+    try {
+      const [chat, unreadMessages] = await Promise.all([
+        this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
+        // Use raw SQL to avoid JSON path issues
+        this.prismaRepository.$queryRaw`
         SELECT COUNT(*)::int as count FROM "Message"
         WHERE "instanceId" = ${this.instanceId}
         AND "key"->>'remoteJid' = ${remoteJid}
         AND ("key"->>'fromMe')::boolean = false
         AND "status" = ${status[3]}
       `.then((result: any[]) => result[0]?.count || 0),
-    ]);
+      ]);
 
-    if (chat && chat.unreadMessages !== unreadMessages) {
-      await this.prismaRepository.chat.update({ where: { id: chat.id }, data: { unreadMessages } });
+      if (chat && chat.unreadMessages !== unreadMessages) {
+        await this.prismaRepository.chat.update({ where: { id: chat.id }, data: { unreadMessages } });
+      }
+
+      return unreadMessages;
+    } catch (e) {
+      console.log(e)
     }
-
-    return unreadMessages;
   }
 
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
