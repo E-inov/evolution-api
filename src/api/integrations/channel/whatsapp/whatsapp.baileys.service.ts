@@ -82,7 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import {makeProxyAgent, makeProxyAgentUndici} from '@utils/makeProxyAgent';
+import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -265,6 +265,28 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
+
+    const db = this.configService.get<Database>('DATABASE');
+    const cache = this.configService.get<CacheConf>('CACHE');
+    const provider = this.configService.get<ProviderSession>('PROVIDER');
+
+    if (provider?.ENABLED) {
+      const authState = await this.authStateProvider.authStateProvider(this.instance.id);
+
+      await authState.removeCreds();
+    }
+
+    if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
+      const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
+
+    if (db.SAVE_DATA.INSTANCE) {
+      const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
 
     const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
     if (sessionExists) {
