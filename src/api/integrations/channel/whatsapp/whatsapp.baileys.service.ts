@@ -4699,9 +4699,9 @@ export class BaileysStartupService extends ChannelStartupService {
   public async getLidForJid(jid: string) {
     const response = {
       lid: await this.client.signalRepository.lidMapping.getLIDForPN(jid)
-    }
+    };
 
-    return response
+    return response;
   }
 
   public async baileysProfilePictureUrl(jid: string, type: 'image' | 'preview', timeoutMs: number) {
