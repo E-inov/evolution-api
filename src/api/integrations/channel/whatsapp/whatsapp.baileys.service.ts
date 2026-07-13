@@ -943,15 +943,47 @@ export class BaileysStartupService extends ChannelStartupService {
       const errorCode = node?.attrs?.error;
       if (!errorCode) return;
 
+      const messageId = node?.attrs?.id;
+      const from = node?.attrs?.from;
+      const ackClass = node?.attrs?.class;
+      // `t` é o timestamp (epoch em segundos) que o WhatsApp envia no ack de erro.
+      const errorTimestamp = node?.attrs?.t ? Number(node.attrs.t) : Math.floor(Date.now() / 1000);
+      // Descrições legíveis dos códigos de erro mais comuns de rejeição de envio.
+      const errorReasons: Record<string, string> = {
+        '400': 'Bad request (mensagem malformada)',
+        '403': 'Forbidden (destinatário bloqueou o número ou sem permissão)',
+        '404': 'Not found (destinatário não existe no WhatsApp)',
+        '408': 'Timeout / destinatário indisponível',
+        '421': 'Blocked (rejeitado como spam/bloqueio temporário)',
+        '463': 'Rejeitado pelo WhatsApp (spam/rate-limit/reputação do número)',
+        '500': 'Erro interno do WhatsApp',
+      };
+
       this.logger.warn({
         message: 'Message send rejected by WhatsApp (error ack)',
         instanceName: this.instance.name,
         instanceId: this.instanceId,
-        messageId: node?.attrs?.id,
-        from: node?.attrs?.from,
-        ackClass: node?.attrs?.class,
+        messageId,
+        from,
+        ackClass,
         errorCode,
         attrs: node?.attrs,
+      });
+
+      // Além de logar, emitimos um MESSAGES_UPDATE de ERRO para que os
+      // consumidores (RabbitMQ/webhook/etc) recebam o motivo real da rejeição
+      // — antes essa informação morria apenas no log.
+      this.sendDataWebhook(Events.MESSAGES_UPDATE, {
+        keyId: messageId,
+        remoteJid: from?.replace(/:.*$/, ''),
+        fromMe: true,
+        status: 'ERROR',
+        error: true,
+        errorCode: Number(errorCode),
+        errorReason: errorReasons[String(errorCode)] ?? 'Rejeitado pelo WhatsApp',
+        ackClass,
+        messageTimestamp: errorTimestamp,
+        instanceId: this.instanceId,
       });
     });
 
