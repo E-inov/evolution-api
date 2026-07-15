@@ -146,7 +146,8 @@ import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
 import cron from 'node-cron';
-import { release } from 'os';
+import { promises as fs } from 'fs';
+import { release, tmpdir } from 'os';
 import { join } from 'path';
 import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
@@ -2890,61 +2891,61 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async convertGifToMp4(gifBuffer: Buffer): Promise<Buffer> {
-    return new Promise<Buffer>((resolve, reject) => {
-      const inputStream = new PassThrough();
-      inputStream.end(gifBuffer);
+    // Usa arquivos temporários para permitir +faststart (átomo moov no início do MP4).
+    // Sem faststart o WhatsApp (principalmente iOS) não consegue baixar/reproduzir o vídeo.
+    const base = join(tmpdir(), `gif2mp4-${v4()}`);
+    const inputPath = `${base}.gif`;
+    const outputPath = `${base}.mp4`;
 
-      const ffmpegProcess = spawn(ffmpegPath.path, [
-        '-f',
-        'gif',
-        '-i',
-        'pipe:0',
-        '-movflags',
-        'frag_keyframe+empty_moov',
-        '-pix_fmt',
-        'yuv420p',
-        // H.264 exige dimensões pares.
-        '-vf',
-        'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-f',
-        'mp4',
-        'pipe:1',
-      ]);
+    await fs.writeFile(inputPath, gifBuffer);
 
-      const outputChunks: Buffer[] = [];
-      let stderrData = '';
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const ffmpegProcess = spawn(ffmpegPath.path, [
+          '-y',
+          '-i',
+          inputPath,
+          '-movflags',
+          '+faststart',
+          '-pix_fmt',
+          'yuv420p',
+          // H.264 exige dimensões pares.
+          '-vf',
+          'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+          '-f',
+          'mp4',
+          outputPath,
+        ]);
 
-      ffmpegProcess.stdout.on('data', (chunk) => outputChunks.push(chunk));
+        let stderrData = '';
 
-      ffmpegProcess.stderr.on('data', (data) => {
-        stderrData += data.toString();
-        this.logger.verbose(`ffmpeg stderr: ${data}`);
+        ffmpegProcess.stderr.on('data', (data) => {
+          stderrData += data.toString();
+          this.logger.verbose(`ffmpeg stderr: ${data}`);
+        });
+
+        ffmpegProcess.on('error', (error) => {
+          console.error('Error in ffmpeg process (gif->mp4)', error);
+          reject(error);
+        });
+
+        ffmpegProcess.on('close', (code) => {
+          if (code === 0) {
+            this.logger.verbose('GIF converted to mp4');
+            resolve();
+          } else {
+            this.logger.error(`ffmpeg (gif->mp4) exited with code ${code}`);
+            this.logger.error(`ffmpeg stderr: ${stderrData}`);
+            reject(new Error(`ffmpeg exited with code ${code}: ${stderrData}`));
+          }
+        });
       });
 
-      ffmpegProcess.on('error', (error) => {
-        console.error('Error in ffmpeg process (gif->mp4)', error);
-        reject(error);
-      });
-
-      ffmpegProcess.on('close', (code) => {
-        if (code === 0) {
-          this.logger.verbose('GIF converted to mp4');
-          resolve(Buffer.concat(outputChunks));
-        } else {
-          this.logger.error(`ffmpeg (gif->mp4) exited with code ${code}`);
-          this.logger.error(`ffmpeg stderr: ${stderrData}`);
-          reject(new Error(`ffmpeg exited with code ${code}: ${stderrData}`));
-        }
-      });
-
-      inputStream.pipe(ffmpegProcess.stdin);
-
-      inputStream.on('error', (err) => {
-        console.error('Error in inputStream (gif->mp4)', err);
-        ffmpegProcess.stdin.end();
-        reject(err);
-      });
-    });
+      return await fs.readFile(outputPath);
+    } finally {
+      await fs.rm(inputPath, { force: true }).catch(() => {});
+      await fs.rm(outputPath, { force: true }).catch(() => {});
+    }
   }
 
   private async convertToWebP(image: string): Promise<Buffer> {
