@@ -2834,9 +2834,19 @@ export class BaileysStartupService extends ChannelStartupService {
         const base64Data = image.replace(/^data:image\/(jpeg|png|gif);base64,/, '');
         imageBuffer = Buffer.from(base64Data, 'base64');
       } else {
-        const timestamp = new Date().getTime();
         const parsedURL = new URL(image);
-        parsedURL.searchParams.set('timestamp', timestamp.toString());
+
+        // Não adicionar cache-buster em URLs pré-assinadas (AWS SigV4 / S3 / DO Spaces),
+        // pois qualquer parâmetro extra invalida a assinatura e resulta em 403 SignatureDoesNotMatch.
+        const isPresignedUrl = Array.from(parsedURL.searchParams.keys()).some((key) =>
+          key.toLowerCase().startsWith('x-amz-'),
+        );
+
+        if (!isPresignedUrl) {
+          const timestamp = new Date().getTime();
+          parsedURL.searchParams.set('timestamp', timestamp.toString());
+        }
+
         const url = parsedURL.toString();
 
         let config: any = { responseType: 'arraybuffer' };
