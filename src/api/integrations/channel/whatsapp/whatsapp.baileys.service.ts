@@ -2678,6 +2678,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async prepareMediaMessage(mediaMessage: MediaMessage) {
     try {
+      // O WhatsApp não suporta GIF nativo: um "GIF animado" é um MP4 enviado com gifPlayback.
+      // Detecta o GIF, transcodifica para MP4 e sinaliza gifPlayback.
+      const gifPlayback = await this.handleGifMedia(mediaMessage);
+
       const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
 
       let mediaInput: any;
@@ -2812,7 +2816,7 @@ export class BaileysStartupService extends ChannelStartupService {
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
 
       if (mediaMessage.mediatype === 'video') {
-        prepareMedia[mediaType].gifPlayback = false;
+        prepareMedia[mediaType].gifPlayback = gifPlayback;
       }
 
       return generateWAMessageFromContent(
@@ -2824,6 +2828,123 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString() || error);
     }
+  }
+
+  private isGifBuffer(buffer: Buffer): boolean {
+    if (!buffer || buffer.length < 6) return false;
+
+    const header = buffer.subarray(0, 6).toString('ascii');
+    return header === 'GIF87a' || header === 'GIF89a';
+  }
+
+  private async fetchMediaBuffer(url: string): Promise<Buffer> {
+    let config: any = { responseType: 'arraybuffer' };
+
+    if (this.localProxy?.enabled) {
+      config = {
+        ...config,
+        httpsAgent: makeProxyAgent({
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
+        }),
+      };
+    }
+
+    const response = await axios.get(url, config);
+    return Buffer.from(response.data, 'binary');
+  }
+
+  // Detecta um GIF e, quando confirmado, transcodifica para MP4 mutando o mediaMessage
+  // para vídeo. Retorna true quando a mídia era um GIF (para habilitar gifPlayback).
+  private async handleGifMedia(mediaMessage: MediaMessage): Promise<boolean> {
+    const media = mediaMessage.media;
+    const lower = typeof media === 'string' ? media.toLowerCase() : '';
+
+    const looksGifByHint = mediaMessage.mimetype === 'image/gif' || lower.includes('.gif');
+
+    let buffer: Buffer;
+
+    if (isURL(media)) {
+      // Só baixa quando há indício de GIF, para não penalizar os demais envios.
+      if (!looksGifByHint) return false;
+      buffer = await this.fetchMediaBuffer(media);
+    } else {
+      buffer = Buffer.from(media, 'base64');
+      if (!looksGifByHint && !this.isGifBuffer(buffer)) return false;
+    }
+
+    // Confirma pelos magic bytes antes de transcodificar.
+    if (!this.isGifBuffer(buffer)) return false;
+
+    const mp4Buffer = await this.convertGifToMp4(buffer);
+
+    mediaMessage.media = mp4Buffer.toString('base64');
+    mediaMessage.mediatype = 'video';
+    mediaMessage.mimetype = 'video/mp4';
+    mediaMessage.fileName = mediaMessage.fileName?.replace(/\.gif$/i, '.mp4') ?? 'video.mp4';
+
+    return true;
+  }
+
+  private async convertGifToMp4(gifBuffer: Buffer): Promise<Buffer> {
+    return new Promise<Buffer>((resolve, reject) => {
+      const inputStream = new PassThrough();
+      inputStream.end(gifBuffer);
+
+      const ffmpegProcess = spawn(ffmpegPath.path, [
+        '-f',
+        'gif',
+        '-i',
+        'pipe:0',
+        '-movflags',
+        'frag_keyframe+empty_moov',
+        '-pix_fmt',
+        'yuv420p',
+        // H.264 exige dimensões pares.
+        '-vf',
+        'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-f',
+        'mp4',
+        'pipe:1',
+      ]);
+
+      const outputChunks: Buffer[] = [];
+      let stderrData = '';
+
+      ffmpegProcess.stdout.on('data', (chunk) => outputChunks.push(chunk));
+
+      ffmpegProcess.stderr.on('data', (data) => {
+        stderrData += data.toString();
+        this.logger.verbose(`ffmpeg stderr: ${data}`);
+      });
+
+      ffmpegProcess.on('error', (error) => {
+        console.error('Error in ffmpeg process (gif->mp4)', error);
+        reject(error);
+      });
+
+      ffmpegProcess.on('close', (code) => {
+        if (code === 0) {
+          this.logger.verbose('GIF converted to mp4');
+          resolve(Buffer.concat(outputChunks));
+        } else {
+          this.logger.error(`ffmpeg (gif->mp4) exited with code ${code}`);
+          this.logger.error(`ffmpeg stderr: ${stderrData}`);
+          reject(new Error(`ffmpeg exited with code ${code}: ${stderrData}`));
+        }
+      });
+
+      inputStream.pipe(ffmpegProcess.stdin);
+
+      inputStream.on('error', (err) => {
+        console.error('Error in inputStream (gif->mp4)', err);
+        ffmpegProcess.stdin.end();
+        reject(err);
+      });
+    });
   }
 
   private async convertToWebP(image: string): Promise<Buffer> {
@@ -2868,7 +2989,7 @@ export class BaileysStartupService extends ChannelStartupService {
         imageBuffer = Buffer.from(response.data, 'binary');
       }
 
-      const isAnimated = this.isAnimated(image, imageBuffer);
+      const isAnimated = await this.isAnimated(image, imageBuffer);
 
       if (isAnimated) {
         return await sharp(imageBuffer, { animated: true }).webp({ quality: 80 }).toBuffer();
@@ -2887,14 +3008,21 @@ export class BaileysStartupService extends ChannelStartupService {
     return buffer.indexOf(Buffer.from('ANIM')) !== -1;
   }
 
-  private isAnimated(image: string, buffer: Buffer): boolean {
+  private async isAnimated(image: string, buffer: Buffer): Promise<boolean> {
     const lowerCaseImage = image.toLowerCase();
 
     if (lowerCaseImage.includes('.gif')) return true;
 
     if (lowerCaseImage.includes('.webp')) return this.isAnimatedWebp(buffer);
 
-    return false;
+    // Quando a mídia vem como base64/arquivo, a extensão não está na string.
+    // Detecta a animação pelo próprio buffer (nº de frames), cobrindo GIF e WebP animados.
+    try {
+      const metadata = await sharp(buffer, { animated: true }).metadata();
+      return (metadata.pages ?? 1) > 1;
+    } catch {
+      return false;
+    }
   }
 
   public async mediaSticker(data: SendStickerDto, file?: any) {
