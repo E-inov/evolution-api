@@ -7,6 +7,7 @@ import { CacheConf, Chatwoot, ConfigService, Database, DelInstance, ProviderSess
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
 import { NotFoundException } from '@exceptions';
+import { reconnectGate } from '@utils/reconnect-gate';
 import { execFileSync } from 'child_process';
 import EventEmitter2 from 'eventemitter2';
 import { rmSync } from 'fs';
@@ -293,18 +294,68 @@ export class WAMonitoringService {
       ownerJid: instanceData.ownerJid,
     });
 
+    // Registered before auto-connect: with the gate below, an instance at the
+    // back of the queue only finishes connecting several waves later, and until
+    // it is in waInstances the API answers "instance not found" for it.
+    this.waInstances[instanceData.instanceName] = instance;
+
     if (instanceData.connectionStatus === 'open' || instanceData.connectionStatus === 'connecting') {
       this.logger.info(
         `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
       );
-      await instance.connectToWhatsapp();
+
+      // Boot loads every instance of the host in parallel (see
+      // loadInstancesFromDatabasePostgres). Without throttling, dozens of
+      // Baileys sockets do their handshake and contact resync at the same
+      // time and the process runs out of RAM — the same failure mode a proxy
+      // blip causes at runtime. Reuse the reconnect gate so startup goes out
+      // in small waves too.
+      const release = await reconnectGate.acquire(instanceData.instanceName);
+
+      // Waiting in line can take minutes on a full boot. Meanwhile the
+      // instance may have been deleted/recreated (registry entry gone or
+      // replaced) or connected by another path (POST /instance/connect) —
+      // calling connectToWhatsapp() now would tear down that live socket.
+      const current = this.waInstances[instanceData.instanceName];
+
+      if (current !== instance || current?.connectionStatus?.state === 'open') {
+        this.logger.info(
+          `Skipping queued auto-connect for "${instanceData.instanceName}" (instance ${
+            current !== instance ? 'was deleted/replaced' : 'already connected'
+          } while waiting)`,
+        );
+        release();
+        return;
+      }
+
+      // Baileys instances keep the slot until connection.update reports 'open'
+      // or 'close', because connectToWhatsapp() returns as soon as the socket
+      // is built. Other channels have no such event, so they release below.
+      const handsOverSlot = typeof instance.holdReconnectSlot === 'function';
+
+      if (handsOverSlot) {
+        instance.holdReconnectSlot(release);
+      }
+
+      let connectStarted = false;
+
+      try {
+        await instance.connectToWhatsapp();
+        connectStarted = true;
+      } finally {
+        // If connectToWhatsapp() threw, no connection.update is coming and a
+        // handed-over slot would only come back via the 120s watchdog —
+        // release it here (idempotent: the instance's stored copy of the same
+        // closure simply becomes a no-op).
+        if (!handsOverSlot || !connectStarted) {
+          release();
+        }
+      }
     } else {
       this.logger.info(
         `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
       );
     }
-
-    this.waInstances[instanceData.instanceName] = instance;
   }
 
   private async loadInstancesFromRedis() {
