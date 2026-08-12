@@ -140,7 +140,6 @@ import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
 import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
-import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
 import { getLinkPreview } from 'link-preview-js';
 import Long from 'long';
@@ -154,7 +153,7 @@ import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import sharp from 'sharp';
-import { PassThrough, Readable } from 'stream';
+import { Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
@@ -465,7 +464,7 @@ export class BaileysStartupService extends ChannelStartupService {
       qrcodeTerminal.generate(qr, { small: true }, (qrcode) =>
         this.logger.log(
           `\n{ instance: ${this.instance.name} pairingCode: ${this.instance.qrcode.pairingCode}, qrcodeCount: ${this.instance.qrcode.count} }\n` +
-          qrcode,
+            qrcode,
         ),
       );
 
@@ -531,9 +530,7 @@ export class BaileysStartupService extends ChannelStartupService {
       if (shouldReconnect) {
         this.scheduleReconnect();
       } else {
-        this.logger.info(
-          `Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`,
-        );
+        this.logger.info(`Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`);
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -737,8 +734,7 @@ export class BaileysStartupService extends ChannelStartupService {
     // single instance). Non-destructive: we keep reconnecting at the slow rate,
     // so the instance can still recover on its own and credentials are never
     // wiped. The counter resets once a connection stays stable (see above).
-    const inBadSessionLoop =
-      this.consecutiveBadSessionCloses >= BaileysStartupService.BAD_SESSION_MAX_RECONNECTS;
+    const inBadSessionLoop = this.consecutiveBadSessionCloses >= BaileysStartupService.BAD_SESSION_MAX_RECONNECTS;
     if (inBadSessionLoop) {
       // Cap stays a floor here (never retry faster than the cap), with jitter
       // added on top so instances stuck in the same loop stay out of lockstep.
@@ -757,9 +753,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 
-    this.logger.info(
-      `Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`,
-    );
+    this.logger.info(`Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`);
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = undefined;
@@ -823,7 +817,6 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private async createClient(number?: string): Promise<WASocket> {
-
     if (this.client) {
       try {
         (this.client.ev as any)?.removeAllListeners();
@@ -916,7 +909,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const fs = await import('fs');
 
-    fs.mkdirSync(`./logs/${this.instance.name}`, { recursive: true })
+    fs.mkdirSync(`./logs/${this.instance.name}`, { recursive: true });
 
     const baileysLogger = P({
       level: this.logBaileys,
@@ -924,10 +917,10 @@ export class BaileysStartupService extends ChannelStartupService {
         target: 'pino/file',
         options: {
           destination: `./logs/${this.instance.name}/baileys-logs.log`,
-          mkdir: true
-        }
-      }
-    })
+          mkdir: true,
+        },
+      },
+    });
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,
@@ -1096,13 +1089,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
-      const chatsToInsert = chats
-        .map((chat) => ({
-          remoteJid: chat.id,
-          instanceId: this.instanceId,
-          name: chat.name,
-          unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
-        }));
+      const chatsToInsert = chats.map((chat) => ({
+        remoteJid: chat.id,
+        instanceId: this.instanceId,
+        name: chat.name,
+        unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
+      }));
 
       this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
     },
@@ -1159,11 +1151,9 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
-
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
 
       for await (const contact of contacts) {
-
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
 
         contactsRaw.push({
@@ -1255,7 +1245,6 @@ export class BaileysStartupService extends ChannelStartupService {
         let chatsRaw: { remoteJid: string; remoteLid: string; instanceId: string; name?: string }[] = [];
 
         for (const chat of chats) {
-
           let remoteJid = null;
           let remoteLid = null;
 
@@ -1281,10 +1270,7 @@ export class BaileysStartupService extends ChannelStartupService {
             const m = chat.messages[0].message;
 
             if (m.messageStubType === proto.WebMessageInfo.StubType.BIZ_PRIVACY_MODE_TO_FB) {
-              if (
-                m.messageStubParameters &&
-                m.messageStubParameters.length > 0
-              ) {
+              if (m.messageStubParameters && m.messageStubParameters.length > 0) {
                 if (!chat.name || chat.name.length === 0) {
                   chat.name = m.messageStubParameters[0];
                 }
@@ -1301,7 +1287,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const messagesRaw: any[] = [];
 
-        let messagesRepository: Set<string>|null = null
+        let messagesRepository: Set<string> | null = null;
 
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
@@ -1415,7 +1401,6 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
-
             await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
 
             if (received.key?.id && editedMessage.key?.id) {
@@ -2087,12 +2072,12 @@ export class BaileysStartupService extends ChannelStartupService {
       const url = match[0].replace(/[.,);\]]+$/u, '');
       if (!url) return undefined;
 
-      const previewData = await getLinkPreview(url, {
+      const previewData = (await getLinkPreview(url, {
         imagesPropertyType: 'og', // fetches only open-graph images
         headers: {
           'user-agent': 'googlebot', // fetches with googlebot to prevent login pages
         },
-      }) as any;
+      })) as any;
 
       if (!previewData || !previewData.title) return undefined;
 
@@ -2106,9 +2091,9 @@ export class BaileysStartupService extends ChannelStartupService {
           thumbnailUrl: image,
           sourceUrl: url,
           mediaUrl: url,
-          renderLargerThumbnail: true
+          renderLargerThumbnail: true,
           // showAdAttribution: true // Removed to prevent "Sent via ad" label
-        }
+        },
       };
     } catch (error) {
       this.logger.error(`Error generating link preview: ${error}`);
@@ -2963,32 +2948,29 @@ export class BaileysStartupService extends ChannelStartupService {
     return true;
   }
 
-  private async convertGifToMp4(gifBuffer: Buffer): Promise<Buffer> {
-    // Usa arquivos temporários para permitir +faststart (átomo moov no início do MP4).
-    // Sem faststart o WhatsApp (principalmente iOS) não consegue baixar/reproduzir o vídeo.
-    const base = join(tmpdir(), `gif2mp4-${v4()}`);
-    const inputPath = `${base}.gif`;
-    const outputPath = `${base}.mp4`;
+  // Transcodifica via ffmpeg usando arquivos temporários — nunca pipes. Os pipes
+  // eram a fonte de três defeitos: EPIPE no stdin quando o ffmpeg encerra antes de
+  // consumir a entrada (virava uncaughtException), container não-seekável na saída
+  // (impedia +faststart, exigindo MP4 fragmentado que o WhatsApp/iOS não reproduz)
+  // e, no fluent-ffmpeg, o kill por "Output stream closed" quando o stream de
+  // saída fecha antes de o processo sair (20ms de tolerância — estoura fácil com
+  // o host sob carga/swap, como no incidente de 12/08/2026).
+  private async ffmpegToBuffer(
+    input: Buffer,
+    inputExt: string,
+    outputExt: string,
+    buildArgs: (inputPath: string, outputPath: string) => string[],
+    label: string,
+  ): Promise<Buffer> {
+    const base = join(tmpdir(), `ffmpeg-${label}-${v4()}`);
+    const inputPath = `${base}.${inputExt}`;
+    const outputPath = `${base}.${outputExt}`;
 
-    await fs.writeFile(inputPath, gifBuffer);
+    await fs.writeFile(inputPath, input);
 
     try {
       await new Promise<void>((resolve, reject) => {
-        const ffmpegProcess = spawn(ffmpegPath.path, [
-          '-y',
-          '-i',
-          inputPath,
-          '-movflags',
-          '+faststart',
-          '-pix_fmt',
-          'yuv420p',
-          // H.264 exige dimensões pares.
-          '-vf',
-          'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-          '-f',
-          'mp4',
-          outputPath,
-        ]);
+        const ffmpegProcess = spawn(ffmpegPath.path, buildArgs(inputPath, outputPath));
 
         let stderrData = '';
 
@@ -2998,16 +2980,16 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         ffmpegProcess.on('error', (error) => {
-          console.error('Error in ffmpeg process (gif->mp4)', error);
+          this.logger.error(`Error in ffmpeg process (${label})`);
           reject(error);
         });
 
         ffmpegProcess.on('close', (code) => {
           if (code === 0) {
-            this.logger.verbose('GIF converted to mp4');
+            this.logger.verbose(`ffmpeg (${label}) finished`);
             resolve();
           } else {
-            this.logger.error(`ffmpeg (gif->mp4) exited with code ${code}`);
+            this.logger.error(`ffmpeg (${label}) exited with code ${code}`);
             this.logger.error(`ffmpeg stderr: ${stderrData}`);
             reject(new Error(`ffmpeg exited with code ${code}: ${stderrData}`));
           }
@@ -3019,6 +3001,32 @@ export class BaileysStartupService extends ChannelStartupService {
       await fs.rm(inputPath, { force: true }).catch(() => {});
       await fs.rm(outputPath, { force: true }).catch(() => {});
     }
+  }
+
+  private async convertGifToMp4(gifBuffer: Buffer): Promise<Buffer> {
+    // +faststart (átomo moov no início do MP4): sem ele o WhatsApp
+    // (principalmente iOS) não consegue baixar/reproduzir o vídeo.
+    return this.ffmpegToBuffer(
+      gifBuffer,
+      'gif',
+      'mp4',
+      (inputPath, outputPath) => [
+        '-y',
+        '-i',
+        inputPath,
+        '-movflags',
+        '+faststart',
+        '-pix_fmt',
+        'yuv420p',
+        // H.264 exige dimensões pares.
+        '-vf',
+        'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-f',
+        'mp4',
+        outputPath,
+      ],
+      'gif2mp4',
+    );
   }
 
   private async convertToWebP(image: string): Promise<Buffer> {
@@ -3182,21 +3190,26 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async processAudioMp4(audio: string) {
-    let inputStream: PassThrough;
+    let audioBuffer: Buffer;
 
     if (isURL(audio)) {
-      const response = await axios.get(audio, { responseType: 'stream' });
-      inputStream = response.data;
+      const response = await axios.get(audio, { responseType: 'arraybuffer' });
+      audioBuffer = Buffer.from(response.data);
     } else {
-      const audioBuffer = Buffer.from(audio, 'base64');
-      inputStream = new PassThrough();
-      inputStream.end(audioBuffer);
+      audioBuffer = Buffer.from(audio, 'base64');
     }
 
-    return new Promise<Buffer>((resolve, reject) => {
-      const ffmpegProcess = spawn(ffmpegPath.path, [
+    // +faststart em vez de frag_keyframe+empty_moov: a fragmentação era exigência
+    // da saída em pipe (container não-seekável); com arquivo temporário dá para
+    // gerar MP4 padrão, que o WhatsApp reproduz — mesmo racional do convertGifToMp4.
+    return this.ffmpegToBuffer(
+      audioBuffer,
+      'bin',
+      'mp4',
+      (inputPath, outputPath) => [
+        '-y',
         '-i',
-        'pipe:0',
+        inputPath,
         '-vn',
         '-ab',
         '128k',
@@ -3205,47 +3218,11 @@ export class BaileysStartupService extends ChannelStartupService {
         '-f',
         'mp4',
         '-movflags',
-        'frag_keyframe+empty_moov',
-        'pipe:1',
-      ]);
-
-      const outputChunks: Buffer[] = [];
-      let stderrData = '';
-
-      ffmpegProcess.stdout.on('data', (chunk) => {
-        outputChunks.push(chunk);
-      });
-
-      ffmpegProcess.stderr.on('data', (data) => {
-        stderrData += data.toString();
-        this.logger.verbose(`ffmpeg stderr: ${data}`);
-      });
-
-      ffmpegProcess.on('error', (error) => {
-        console.error('Error in ffmpeg process', error);
-        reject(error);
-      });
-
-      ffmpegProcess.on('close', (code) => {
-        if (code === 0) {
-          this.logger.verbose('Audio converted to mp4');
-          const outputBuffer = Buffer.concat(outputChunks);
-          resolve(outputBuffer);
-        } else {
-          this.logger.error(`ffmpeg exited with code ${code}`);
-          this.logger.error(`ffmpeg stderr: ${stderrData}`);
-          reject(new Error(`ffmpeg exited with code ${code}: ${stderrData}`));
-        }
-      });
-
-      inputStream.pipe(ffmpegProcess.stdin);
-
-      inputStream.on('error', (err) => {
-        console.error('Error in inputStream', err);
-        ffmpegProcess.stdin.end();
-        reject(err);
-      });
-    });
+        '+faststart',
+        outputPath,
+      ],
+      'audio2mp4',
+    );
   }
 
   public async processAudio(audio: string): Promise<Buffer> {
@@ -3271,84 +3248,84 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.verbose('Audio converted');
       return Buffer.from(data.audio, 'base64');
     } else {
-      let inputAudioStream: PassThrough;
+      let audioBuffer: Buffer;
 
       if (isURL(audio)) {
-        const timestamp = new Date().getTime();
         const parsedURL = new URL(audio);
-        parsedURL.searchParams.set('timestamp', timestamp.toString());
-        const url = parsedURL.toString();
 
-        const config: any = { responseType: 'stream' };
+        // Não adicionar cache-buster em URLs pré-assinadas (AWS SigV4 / S3 / DO Spaces):
+        // qualquer parâmetro extra invalida a assinatura e resulta em 403
+        // SignatureDoesNotMatch — mesmo fix aplicado ao convertToWebP.
+        const isPresignedUrl = Array.from(parsedURL.searchParams.keys()).some((key) =>
+          key.toLowerCase().startsWith('x-amz-'),
+        );
 
-        const response = await axios.get(url, config);
-        inputAudioStream = response.data.pipe(new PassThrough());
+        if (!isPresignedUrl) {
+          const timestamp = new Date().getTime();
+          parsedURL.searchParams.set('timestamp', timestamp.toString());
+        }
+
+        const response = await axios.get(parsedURL.toString(), { responseType: 'arraybuffer' });
+        audioBuffer = Buffer.from(response.data);
       } else {
-        const audioBuffer = Buffer.from(audio, 'base64');
-        inputAudioStream = new PassThrough();
-        inputAudioStream.end(audioBuffer);
+        audioBuffer = Buffer.from(audio, 'base64');
       }
 
       const isLpcm = isURL(audio) && /\.lpcm($|\?)/i.test(audio);
 
-      return new Promise((resolve, reject) => {
-        const outputAudioStream = new PassThrough();
-        const chunks: Buffer[] = [];
+      if (isLpcm) {
+        this.logger.verbose('Detected LPCM input – applying raw PCM settings');
+      }
 
-        outputAudioStream.on('data', (chunk) => chunks.push(chunk));
-        outputAudioStream.on('end', () => {
-          const outputBuffer = Buffer.concat(chunks);
-          resolve(outputBuffer);
-        });
-
-        outputAudioStream.on('error', (error) => {
-          console.log('error', error);
-          reject(error);
-        });
-
-        ffmpeg.setFfmpegPath(ffmpegPath.path);
-
-        let command = ffmpeg(inputAudioStream);
-
-        if (isLpcm) {
-          this.logger.verbose('Detected LPCM input – applying raw PCM settings');
-          command = command.inputFormat('s16le').inputOptions(['-ar', '24000', '-ac', '1']);
-        }
-
-        command
-          .outputFormat('ogg')
-          .noVideo()
-          .audioCodec('libopus')
-          .addOutputOptions('-avoid_negative_ts make_zero')
-          .audioBitrate('48k')
-          .audioFrequency(48000)
-          .audioChannels(1)
-          .outputOptions([
-            '-write_xing',
-            '0',
-            '-compression_level',
-            '10',
-            '-application',
-            'voip',
-            '-fflags',
-            '+bitexact',
-            '-flags',
-            '+bitexact',
-            '-id3v2_version',
-            '0',
-            '-map_metadata',
-            '-1',
-            '-map_chapters',
-            '-1',
-            '-write_bext',
-            '0',
-          ])
-          .pipe(outputAudioStream, { end: true })
-          .on('error', function (error) {
-            console.log('error', error);
-            reject(error);
-          });
-      });
+      // Substitui o fluent-ffmpeg: o `.on('error')` encadeado após `.pipe()` escutava
+      // o stream de saída (pipe() retorna o stream, não o command), deixando o command
+      // sem listener — cada erro dele ("Output stream closed", exit != 0) virava
+      // uncaughtException e a Promise ficava pendente para sempre, travando o envio.
+      return this.ffmpegToBuffer(
+        audioBuffer,
+        'bin',
+        'ogg',
+        (inputPath, outputPath) => [
+          '-y',
+          // LPCM é PCM cru, sem header: o formato e a taxa precisam vir antes do -i.
+          ...(isLpcm ? ['-f', 's16le', '-ar', '24000', '-ac', '1'] : []),
+          '-i',
+          inputPath,
+          '-vn',
+          '-c:a',
+          'libopus',
+          '-b:a',
+          '48k',
+          '-ar',
+          '48000',
+          '-ac',
+          '1',
+          '-avoid_negative_ts',
+          'make_zero',
+          '-write_xing',
+          '0',
+          '-compression_level',
+          '10',
+          '-application',
+          'voip',
+          '-fflags',
+          '+bitexact',
+          '-flags',
+          '+bitexact',
+          '-id3v2_version',
+          '0',
+          '-map_metadata',
+          '-1',
+          '-map_chapters',
+          '-1',
+          '-write_bext',
+          '0',
+          '-f',
+          'ogg',
+          outputPath,
+        ],
+        'audio2opus',
+      );
     }
   }
 
@@ -5055,7 +5032,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async getLidForJid(jid: string) {
     const response = {
-      lid: await this.client.signalRepository.lidMapping.getLIDForPN(jid)
+      lid: await this.client.signalRepository.lidMapping.getLIDForPN(jid),
     };
 
     return response;
@@ -5063,7 +5040,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async getJidForLid(lid: string) {
     const response = {
-      jid: await this.client.signalRepository.lidMapping.getPNForLID(lid)
+      jid: await this.client.signalRepository.lidMapping.getPNForLID(lid),
     };
 
     return response;
