@@ -32,6 +32,16 @@ export class ChannelStartupService {
   public readonly logger = new Logger('ChannelStartupService');
 
   public client: WASocket;
+
+  /**
+   * Implemented by channels whose connectToWhatsapp() returns before the
+   * connection settles (Baileys): takes over a reconnect-gate slot and holds
+   * it until connection.update reports 'open' or 'close'. Channels without it
+   * are done connecting when connectToWhatsapp() resolves, so the caller
+   * releases the slot itself. See @utils/reconnect-gate.
+   */
+  public holdReconnectSlot?: (release: () => void) => void;
+
   public readonly instance: wa.Instance = {};
   public readonly localChatwoot: wa.LocalChatwoot = {};
   public readonly localProxy: wa.LocalProxy = {};

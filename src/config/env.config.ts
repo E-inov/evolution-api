@@ -396,6 +396,10 @@ export type EventEmitter = {
   MAX_LISTENERS: number;
 };
 
+export type Reconnect = {
+  MAX_CONCURRENT: number;
+};
+
 export type Production = boolean;
 
 export interface Env {
@@ -436,6 +440,7 @@ export interface Env {
   FACEBOOK: Facebook;
   SENTRY: Sentry;
   EVENT_EMITTER: EventEmitter;
+  RECONNECT: Reconnect;
   PRODUCTION?: Production;
 }
 
@@ -921,6 +926,9 @@ export class ConfigService {
       },
       EVENT_EMITTER: {
         MAX_LISTENERS: Number.parseInt(process.env?.EVENT_EMITTER_MAX_LISTENERS) || 50,
+      },
+      RECONNECT: {
+        MAX_CONCURRENT: Number.parseInt(process.env?.RECONNECT_MAX_CONCURRENT) || 4,
       },
     };
   }

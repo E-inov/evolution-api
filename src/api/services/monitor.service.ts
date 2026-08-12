@@ -314,20 +314,24 @@ export class WAMonitoringService {
 
       // Baileys instances keep the slot until connection.update reports 'open'
       // or 'close', because connectToWhatsapp() returns as soon as the socket
-      // is built. Other channels have no such event, so they release here.
-      // Checked by capability instead of instanceof to avoid an import cycle
-      // through server.module.
-      const slotHolder = instance as unknown as { holdReconnectSlot?: (release: () => void) => void };
-      const handsOverSlot = typeof slotHolder.holdReconnectSlot === 'function';
+      // is built. Other channels have no such event, so they release below.
+      const handsOverSlot = typeof instance.holdReconnectSlot === 'function';
 
       if (handsOverSlot) {
-        slotHolder.holdReconnectSlot(release);
+        instance.holdReconnectSlot(release);
       }
+
+      let connectStarted = false;
 
       try {
         await instance.connectToWhatsapp();
+        connectStarted = true;
       } finally {
-        if (!handsOverSlot) {
+        // If connectToWhatsapp() threw, no connection.update is coming and a
+        // handed-over slot would only come back via the 120s watchdog —
+        // release it here (idempotent: the instance's stored copy of the same
+        // closure simply becomes a no-op).
+        if (!handsOverSlot || !connectStarted) {
           release();
         }
       }

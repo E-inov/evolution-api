@@ -1,3 +1,4 @@
+import { configService, Reconnect } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 
 const logger = new Logger('ReconnectGate');
@@ -10,13 +11,10 @@ const MAX_SLOT_HOLD_MS = 120_000;
 const DEFAULT_MAX_CONCURRENT = 4;
 
 function resolveMaxConcurrent(): number {
-  const parsed = Number(process.env.RECONNECT_MAX_CONCURRENT);
+  const configured = configService.get<Reconnect>('RECONNECT').MAX_CONCURRENT;
 
-  if (Number.isInteger(parsed) && parsed > 0) {
-    return parsed;
-  }
-
-  return DEFAULT_MAX_CONCURRENT;
+  // 0 or a negative value would park every reconnection forever.
+  return configured > 0 ? configured : DEFAULT_MAX_CONCURRENT;
 }
 
 /**
@@ -42,18 +40,6 @@ class ReconnectGate {
   private readonly maxConcurrent = resolveMaxConcurrent();
   private inFlight = 0;
   private readonly waiting: Array<() => void> = [];
-
-  public get queueLength(): number {
-    return this.waiting.length;
-  }
-
-  public get activeCount(): number {
-    return this.inFlight;
-  }
-
-  public get limit(): number {
-    return this.maxConcurrent;
-  }
 
   /**
    * Waits for a free slot and returns the function that gives it back. The

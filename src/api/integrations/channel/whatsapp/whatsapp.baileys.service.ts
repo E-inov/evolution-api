@@ -773,10 +773,17 @@ export class BaileysStartupService extends ChannelStartupService {
         // resync are done, so releasing here would not limit anything.
         this.releaseReconnectSlot = await reconnectGate.acquire(this.instance.name);
 
-        // Waiting in line can take a while under a mass reconnect; the instance
-        // may have been deleted or ended in the meantime.
+        // Waiting in line can take a while under a mass reconnect; the
+        // instance may have been deleted/ended, or already reconnected by
+        // another path (manual connect, QR re-pair), in the meantime.
+        // Reconnecting on top of a live socket would tear it down.
         if (this.isDeleting || this.endSession) {
           this.logger.info('Instance is being deleted/ended, dropping queued reconnect');
+          return;
+        }
+
+        if (this.stateConnection.state === 'open') {
+          this.logger.info('Connection already open again, dropping queued reconnect');
           return;
         }
 
@@ -807,12 +814,13 @@ export class BaileysStartupService extends ChannelStartupService {
    * Takes over a reconnect slot acquired by someone else — used by the boot-time
    * auto-connect, which loads every instance at once and needs the same
    * throttling. The slot is then released by connection.update ('open' or
-   * 'close') exactly like a slot taken by scheduleReconnect().
+   * 'close') exactly like a slot taken by scheduleReconnect(). A class field
+   * (not a method) because the base class declares it as an optional property.
    */
-  public holdReconnectSlot(release: () => void): void {
+  public holdReconnectSlot = (release: () => void): void => {
     this.freeReconnectSlot();
     this.releaseReconnectSlot = release;
-  }
+  };
 
   private async createClient(number?: string): Promise<WASocket> {
 
