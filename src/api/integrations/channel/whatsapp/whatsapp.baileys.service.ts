@@ -84,6 +84,7 @@ import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import { reconnectGate } from '@utils/reconnect-gate';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -263,6 +264,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private reconnectAttempts = 0;
   private consecutiveBadSessionCloses = 0;
   private lastConnectionOpenAt?: number;
+  // Set while this instance holds a slot in the process-wide reconnect gate.
+  private releaseReconnectSlot?: () => void;
   private static readonly RECONNECT_BACKOFF_BASE_MS = 3000;
   private static readonly RECONNECT_BACKOFF_CAP_MS = 60000;
   private static readonly RECONNECT_STABLE_RESET_MS = 30000;
@@ -480,6 +483,10 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      // This attempt is over — give the reconnect slot back before anything
+      // else, including the early returns below, so the queue keeps moving.
+      this.freeReconnectSlot();
+
       // Check if instance is being deleted or session is ending
       if (this.isDeleting || this.endSession) {
         this.logger.info('Instance is being deleted/ended, skipping reconnection attempt');
@@ -569,6 +576,10 @@ export class BaileysStartupService extends ChannelStartupService {
       // dies again. Both counters are reset only after the connection stays
       // stable for RECONNECT_STABLE_RESET_MS — see scheduleReconnect().
       this.lastConnectionOpenAt = Date.now();
+
+      // Connection is up: the slot did its job, hand it to the next in line.
+      this.freeReconnectSlot();
+
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -707,10 +718,19 @@ export class BaileysStartupService extends ChannelStartupService {
       this.consecutiveBadSessionCloses = 0;
     }
 
-    let delay = Math.min(
+    const backoffTarget = Math.min(
       BaileysStartupService.RECONNECT_BACKOFF_BASE_MS * 2 ** this.reconnectAttempts,
       BaileysStartupService.RECONNECT_BACKOFF_CAP_MS,
     );
+
+    // Jitter the delay instead of using the raw backoff. Every instance on this
+    // host leaves through the same proxy, so a proxy blip closes all of them in
+    // the same millisecond with an identical attempt counter — and an
+    // un-jittered backoff makes all of them come back at the exact same instant
+    // (observed 2026-08-12: 124 reconnects inside a single minute on one host).
+    // Half the target is a fixed floor, so the backoff still grows attempt over
+    // attempt; the other half is randomised to break the lockstep.
+    let delay = backoffTarget / 2 + Math.random() * (backoffTarget / 2);
 
     // After repeated badSession (500) closes, floor the delay at the cap so a
     // tight open→close loop stops hammering the server (observed: ~800/h for a
@@ -720,7 +740,11 @@ export class BaileysStartupService extends ChannelStartupService {
     const inBadSessionLoop =
       this.consecutiveBadSessionCloses >= BaileysStartupService.BAD_SESSION_MAX_RECONNECTS;
     if (inBadSessionLoop) {
-      delay = BaileysStartupService.RECONNECT_BACKOFF_CAP_MS;
+      // Cap stays a floor here (never retry faster than the cap), with jitter
+      // added on top so instances stuck in the same loop stay out of lockstep.
+      delay =
+        BaileysStartupService.RECONNECT_BACKOFF_CAP_MS +
+        Math.random() * BaileysStartupService.RECONNECT_BACKOFF_BASE_MS;
       this.logger.warn({
         message: 'badSession (500) reconnect loop — throttling retries to cap; may need manual re-pair',
         consecutiveBadSessionCloses: this.consecutiveBadSessionCloses,
@@ -734,19 +758,49 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 
     this.logger.info(
-      `Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`,
+      `Reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempts})`,
     );
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = undefined;
+      let connectStarted = false;
+
       try {
+        // Queue behind the process-wide gate so a mass reconnect goes out in
+        // small waves rather than all at once. The slot is held until the
+        // socket reports 'open' or 'close' — createClient() returns as soon as
+        // the socket is built, well before the expensive handshake and contact
+        // resync are done, so releasing here would not limit anything.
+        this.releaseReconnectSlot = await reconnectGate.acquire(this.instance.name);
+
+        // Waiting in line can take a while under a mass reconnect; the instance
+        // may have been deleted or ended in the meantime.
+        if (this.isDeleting || this.endSession) {
+          this.logger.info('Instance is being deleted/ended, dropping queued reconnect');
+          return;
+        }
+
         await this.connectToWhatsapp(this.phoneNumber);
+        connectStarted = true;
       } catch (error) {
         this.logger.error({ message: 'Reconnect attempt failed', error });
       } finally {
+        // Once the socket is up the slot stays held until connection.update
+        // reports 'open' or 'close'. On an early return or a throw there is no
+        // such event coming, so release it right here.
+        if (!connectStarted) {
+          this.freeReconnectSlot();
+        }
+
         this.isReconnecting = false;
       }
     }, delay);
+  }
+
+  /** Gives back the reconnect slot, if this instance is holding one. */
+  private freeReconnectSlot(): void {
+    this.releaseReconnectSlot?.();
+    this.releaseReconnectSlot = undefined;
   }
 
   private async createClient(number?: string): Promise<WASocket> {
