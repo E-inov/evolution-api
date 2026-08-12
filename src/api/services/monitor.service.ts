@@ -312,6 +312,22 @@ export class WAMonitoringService {
       // in small waves too.
       const release = await reconnectGate.acquire(instanceData.instanceName);
 
+      // Waiting in line can take minutes on a full boot. Meanwhile the
+      // instance may have been deleted/recreated (registry entry gone or
+      // replaced) or connected by another path (POST /instance/connect) —
+      // calling connectToWhatsapp() now would tear down that live socket.
+      const current = this.waInstances[instanceData.instanceName];
+
+      if (current !== instance || current?.connectionStatus?.state === 'open') {
+        this.logger.info(
+          `Skipping queued auto-connect for "${instanceData.instanceName}" (instance ${
+            current !== instance ? 'was deleted/replaced' : 'already connected'
+          } while waiting)`,
+        );
+        release();
+        return;
+      }
+
       // Baileys instances keep the slot until connection.update reports 'open'
       // or 'close', because connectToWhatsapp() returns as soon as the socket
       // is built. Other channels have no such event, so they release below.
