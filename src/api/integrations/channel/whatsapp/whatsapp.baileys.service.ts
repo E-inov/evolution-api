@@ -803,6 +803,17 @@ export class BaileysStartupService extends ChannelStartupService {
     this.releaseReconnectSlot = undefined;
   }
 
+  /**
+   * Takes over a reconnect slot acquired by someone else — used by the boot-time
+   * auto-connect, which loads every instance at once and needs the same
+   * throttling. The slot is then released by connection.update ('open' or
+   * 'close') exactly like a slot taken by scheduleReconnect().
+   */
+  public holdReconnectSlot(release: () => void): void {
+    this.freeReconnectSlot();
+    this.releaseReconnectSlot = release;
+  }
+
   private async createClient(number?: string): Promise<WASocket> {
 
     if (this.client) {
