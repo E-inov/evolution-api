@@ -275,6 +275,12 @@ export class BaileysStartupService extends ChannelStartupService {
   // for unmapped stream errors, so it must NOT be treated as a hard logout.
   private static readonly BAD_SESSION_MAX_RECONNECTS = 5;
 
+  // While alwaysOnline=false, periodically report 'unavailable' so the phone
+  // keeps receiving push notifications (iPhones otherwise show the companion
+  // as online and suppress notifications / show "Finished syncing").
+  private unavailablePresenceTimer?: NodeJS.Timeout;
+  private static readonly UNAVAILABLE_PRESENCE_INTERVAL_MS = 15000;
+
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
   private historySyncChatCount = 0;
@@ -485,6 +491,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // This attempt is over — give the reconnect slot back before anything
       // else, including the early returns below, so the queue keeps moving.
       this.freeReconnectSlot();
+      this.stopUnavailablePresenceKeepAlive();
 
       // Check if instance is being deleted or session is ending
       if (this.isDeleting || this.endSession) {
@@ -577,6 +584,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // Connection is up: the slot did its job, hand it to the next in line.
       this.freeReconnectSlot();
 
+      this.startUnavailablePresenceKeepAlive();
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -629,6 +637,25 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+    }
+  }
+
+  private startUnavailablePresenceKeepAlive() {
+    this.stopUnavailablePresenceKeepAlive();
+
+    if (this.localSettings.alwaysOnline) {
+      return;
+    }
+
+    this.unavailablePresenceTimer = setInterval(() => {
+      this.client?.sendPresenceUpdate('unavailable').catch(() => undefined);
+    }, BaileysStartupService.UNAVAILABLE_PRESENCE_INTERVAL_MS);
+  }
+
+  private stopUnavailablePresenceKeepAlive() {
+    if (this.unavailablePresenceTimer) {
+      clearInterval(this.unavailablePresenceTimer);
+      this.unavailablePresenceTimer = undefined;
     }
   }
 
@@ -935,7 +962,10 @@ export class BaileysStartupService extends ChannelStartupService {
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
-      markOnlineOnConnect: this.localSettings.alwaysOnline,
+      // Must be a strict boolean: if settings haven't loaded yet this would be
+      // undefined and Baileys defaults markOnlineOnConnect to TRUE, which makes
+      // iPhones suppress push notifications while the socket is connected.
+      markOnlineOnConnect: this.localSettings.alwaysOnline === true,
       retryRequestDelayMs: 350,
       maxMsgRetryCount: 4,
       fireInitQueries: true,
@@ -1062,7 +1092,9 @@ export class BaileysStartupService extends ChannelStartupService {
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
       this.loadChatwoot();
-      this.loadSettings();
+      // Awaited so localSettings (alwaysOnline → markOnlineOnConnect) is loaded
+      // before makeWASocket reads it in createClient.
+      await this.loadSettings();
       this.loadWebhook();
       this.loadProxy();
 
