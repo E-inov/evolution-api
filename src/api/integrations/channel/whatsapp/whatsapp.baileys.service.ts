@@ -90,8 +90,8 @@ import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
 import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-redis-db';
-import axios from 'axios';
 import audioDecode from 'audio-decode';
+import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
   BufferedEventData,
@@ -141,12 +141,12 @@ import { isArray, isBase64, isURL } from 'class-validator';
 import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import FormData from 'form-data';
+import { promises as fs } from 'fs';
 import { getLinkPreview } from 'link-preview-js';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
 import cron from 'node-cron';
-import { promises as fs } from 'fs';
 import { release, tmpdir } from 'os';
 import { join } from 'path';
 import P from 'pino';
@@ -298,6 +298,13 @@ export class BaileysStartupService extends ChannelStartupService {
   // never drain). Generous because messaging-history.set can legitimately
   // take minutes.
   private static readonly EVENT_BATCH_TIMEOUT_MS = 300_000;
+
+  // connection.update runs outside the main event queue (see eventHandler), but
+  // the updates still need ordering AMONG THEMSELVES: a slow 'connecting'/'open'
+  // handler finishing after a newer 'close' would overwrite state/DB with stale
+  // data. Dedicated chain, independent from the message queue; never rejects,
+  // so one failed update cannot wedge the next.
+  private connectionUpdateChain: Promise<unknown> = Promise.resolve();
 
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
@@ -711,9 +718,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (this.socketDeadChecks >= BaileysStartupService.SOCKET_LIVENESS_STRIKES) {
           this.socketDeadChecks = 0;
-          this.forceZombieRecovery().catch((error) =>
-            this.logger.error({ message: 'Zombie recovery failed', error }),
-          );
+          this.forceZombieRecovery().catch((error) => this.logger.error({ message: 'Zombie recovery failed', error }));
         }
       } else {
         this.socketDeadChecks = 0;
@@ -1381,7 +1386,7 @@ export class BaileysStartupService extends ChannelStartupService {
           contactsMapLidJid.set(contact.id, { jid });
         }
 
-        let chatsRaw: { remoteJid: string; remoteLid: string; instanceId: string; name?: string }[] = [];
+        const chatsRaw: { remoteJid: string; remoteLid: string; instanceId: string; name?: string }[] = [];
 
         for (const chat of chats) {
           let remoteJid = null;
@@ -1426,7 +1431,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const messagesRaw: any[] = [];
 
-        let messagesRepository: Set<string> | null = null;
+        const messagesRepository: Set<string> | null = null;
 
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
@@ -1953,137 +1958,140 @@ export class BaileysStartupService extends ChannelStartupService {
       // socket dead, the 'close' never processed, no reconnect ever scheduled
       // (incident 2026-08-17, instance f880ba41).
       if (events['connection.update'] && !this.endSession) {
-        this.connectionUpdate(events['connection.update']).catch((error) =>
-          this.logger.error({ message: 'connectionUpdate failed', error }),
+        const update = events['connection.update'];
+        this.connectionUpdateChain = this.connectionUpdateChain.then(() =>
+          this.connectionUpdate(update).catch((error) =>
+            this.logger.error({ message: 'connectionUpdate failed', error }),
+          ),
         );
       }
 
       this.eventProcessingQueue = this.eventProcessingQueue.then(() => {
         const batch = (async () => {
-        try {
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+          try {
+            if (!this.endSession) {
+              const database = this.configService.get<Database>('DATABASE');
+              const settings = await this.findSettings();
 
-            if (events.call) {
-              const call = events.call[0];
+              if (events.call) {
+                const call = events.call[0];
 
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
-
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+                if (settings?.rejectCall && call.status == 'offer') {
+                  this.client.rejectCall(call.id, call.from);
                 }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+                  if (call.from.endsWith('@lid')) {
+                    call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+                  }
+                  const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+                  this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                }
+
+                this.sendDataWebhook(Events.CALL, call);
               }
 
-              this.sendDataWebhook(Events.CALL, call);
-            }
+              if (events['creds.update']) {
+                this.instance.authState.saveCreds();
+              }
 
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
+              if (events['messaging-history.set']) {
+                const payload = events['messaging-history.set'];
+                // @ts-ignore
+                await this.messageHandle['messaging-history.set'](payload);
+              }
 
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              // @ts-ignore
-              await this.messageHandle['messaging-history.set'](payload);
-            }
+              if (events['messages.upsert']) {
+                const payload = events['messages.upsert'];
 
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
+                // this.messageProcessor.processMessage(payload, settings);
+                await this.messageHandle['messages.upsert'](payload, settings);
+              }
 
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
+              if (events['messages.update']) {
+                const payload = events['messages.update'];
+                await this.messageHandle['messages.update'](payload, settings);
+              }
 
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
+              if (events['message-receipt.update']) {
+                const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+                const remotesJidMap: Record<string, number> = {};
 
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
-
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                for (const event of payload) {
+                  if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                    remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                  }
                 }
               }
-            }
 
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
+              if (events['presence.update']) {
+                const payload = events['presence.update'];
 
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+                if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+                  return;
+                }
+
+                this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+              }
+
+              if (!settings?.groupsIgnore) {
+                if (events['groups.upsert']) {
+                  const payload = events['groups.upsert'];
+                  this.groupHandler['groups.upsert'](payload);
+                }
+
+                if (events['groups.update']) {
+                  const payload = events['groups.update'];
+                  this.groupHandler['groups.update'](payload);
+                }
+
+                if (events['group-participants.update']) {
+                  const payload = events['group-participants.update'] as any;
+                  this.groupHandler['group-participants.update'](payload);
+                }
+              }
+
+              if (events['chats.upsert']) {
+                const payload = events['chats.upsert'];
+                this.chatHandle['chats.upsert'](payload);
+              }
+
+              if (events['chats.update']) {
+                const payload = events['chats.update'];
+                this.chatHandle['chats.update'](payload);
+              }
+
+              if (events['chats.delete']) {
+                const payload = events['chats.delete'];
+                this.chatHandle['chats.delete'](payload);
+              }
+
+              if (events['contacts.upsert']) {
+                const payload = events['contacts.upsert'];
+                this.contactHandle['contacts.upsert'](payload);
+              }
+
+              if (events['contacts.update']) {
+                const payload = events['contacts.update'];
+                this.contactHandle['contacts.update'](payload);
+              }
+
+              if (events[Events.LABELS_ASSOCIATION]) {
+                const payload = events[Events.LABELS_ASSOCIATION];
+                this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
                 return;
               }
 
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
+              if (events[Events.LABELS_EDIT]) {
+                const payload = events[Events.LABELS_EDIT];
+                this.labelHandle[Events.LABELS_EDIT](payload);
+                return;
               }
             }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
-            }
+          } catch (error) {
+            this.logger.error(error);
           }
-        } catch (error) {
-          this.logger.error(error);
-        }
         })();
 
         // A batch that never resolves must not freeze the queue forever — the
