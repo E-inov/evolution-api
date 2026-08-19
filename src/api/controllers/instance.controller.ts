@@ -373,8 +373,39 @@ export class InstanceController {
       if (state === 'open' || state === 'connecting') {
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
 
+        // O caminho antigo (ws.close/end + connectToWhatsapp) era inócuo para o zumbi
+        // profundo: com o client morto, close()/end() são no-op silencioso (optional
+        // chaining), nenhum 'close' é emitido e o connectToWhatsapp retorna cedo porque o
+        // estado segue preso em 'open'. Medido em produção (19/08/2026): instâncias 'open'
+        // sem socket havia horas, e o restart só logava "Restarting instance" e retornava.
+        //
+        // reloadConnection() cria um socket NOVO incondicionalmente: createClient() faz o
+        // teardown do client antigo (listeners, ws.close, end, fila de eventos drenada e
+        // pausa de 500ms contra o 428 connectionReplaced), e um reconnect que o close do
+        // socket velho tenha enfileirado é descartado pelo guard pós-fila do
+        // scheduleReconnect() ("Connection already open again").
+        if (typeof instance.reloadConnection === 'function') {
+          await instance.reloadConnection();
+          // Wait a bit for the reconnection to be established
+          await new Promise((r) => setTimeout(r, 2000));
+
+          return {
+            instance: {
+              instanceName: instanceName,
+              status: instance.connectionStatus?.state || 'connecting',
+            },
+          };
+        }
+
         instance.client?.ws?.close();
         instance.client?.end(new Error('restart'));
+        // end() emits the 'close' connection.update asynchronously. Without
+        // waiting for it, connectToWhatsapp reads the stale 'open' and returns
+        // early — the caller gets a 200 with state 'open' and no QR even though
+        // the socket is already dead (zombie restart, incident 2026-08-17).
+        for (let i = 0; i < 10 && instance.connectionStatus?.state === 'open'; i++) {
+          await new Promise((r) => setTimeout(r, 300));
+        }
         return await this.connectToWhatsapp({ instanceName });
       }
 
@@ -391,7 +422,6 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
-
     this.logger.error(this.waMonitor.waInstances[instanceName]?.connectionStatus);
 
     return {
