@@ -281,6 +281,24 @@ export class BaileysStartupService extends ChannelStartupService {
   private unavailablePresenceTimer?: NodeJS.Timeout;
   private static readonly UNAVAILABLE_PRESENCE_INTERVAL_MS = 15000;
 
+  // Zombie-socket watchdog: stateConnection can get stuck on 'open' while the
+  // underlying websocket is dead (the 'close' event was lost/never processed).
+  // In that state every endpoint lies (connect returns no QR, restart no-ops)
+  // and the instance never recovers on its own — incident 2026-08-17, instance
+  // f880ba41: dead since ~12:00Z, still 'open' 32h later. The watchdog compares
+  // stateConnection against the real ws readyState and forces a close+reconnect
+  // after two consecutive dead checks.
+  private socketLivenessTimer?: NodeJS.Timeout;
+  private socketDeadChecks = 0;
+  private static readonly SOCKET_LIVENESS_INTERVAL_MS = 30_000;
+  private static readonly SOCKET_LIVENESS_STRIKES = 2;
+
+  // Upper bound for one serialized event batch. A batch that never resolves
+  // must not freeze the queue forever (messages stop flowing, later events
+  // never drain). Generous because messaging-history.set can legitimately
+  // take minutes.
+  private static readonly EVENT_BATCH_TIMEOUT_MS = 300_000;
+
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
   private historySyncChatCount = 0;
@@ -301,6 +319,9 @@ export class BaileysStartupService extends ChannelStartupService {
     // Mark instance as deleting to prevent reconnection attempts
     this.isDeleting = true;
     this.endSession = true;
+
+    this.stopSocketLivenessWatchdog();
+    this.stopUnavailablePresenceKeepAlive();
 
     this.messageProcessor.onDestroy();
 
@@ -492,6 +513,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // else, including the early returns below, so the queue keeps moving.
       this.freeReconnectSlot();
       this.stopUnavailablePresenceKeepAlive();
+      this.stopSocketLivenessWatchdog();
 
       // Check if instance is being deleted or session is ending
       if (this.isDeleting || this.endSession) {
@@ -585,6 +607,7 @@ export class BaileysStartupService extends ChannelStartupService {
       this.freeReconnectSlot();
 
       this.startUnavailablePresenceKeepAlive();
+      this.startSocketLivenessWatchdog();
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -657,6 +680,83 @@ export class BaileysStartupService extends ChannelStartupService {
       clearInterval(this.unavailablePresenceTimer);
       this.unavailablePresenceTimer = undefined;
     }
+  }
+
+  private startSocketLivenessWatchdog() {
+    this.stopSocketLivenessWatchdog();
+    this.socketDeadChecks = 0;
+
+    this.socketLivenessTimer = setInterval(() => {
+      if (this.isDeleting || this.endSession) {
+        this.stopSocketLivenessWatchdog();
+        return;
+      }
+
+      const wsAlive = this.client?.ws?.isOpen === true;
+
+      if (this.stateConnection.state === 'open' && !wsAlive) {
+        this.socketDeadChecks += 1;
+        this.logger.warn({
+          message: 'Socket liveness check failed: state is open but websocket is not',
+          deadChecks: this.socketDeadChecks,
+          instanceName: this.instance.name,
+        });
+
+        if (this.socketDeadChecks >= BaileysStartupService.SOCKET_LIVENESS_STRIKES) {
+          this.socketDeadChecks = 0;
+          this.forceZombieRecovery().catch((error) =>
+            this.logger.error({ message: 'Zombie recovery failed', error }),
+          );
+        }
+      } else {
+        this.socketDeadChecks = 0;
+      }
+    }, BaileysStartupService.SOCKET_LIVENESS_INTERVAL_MS);
+  }
+
+  private stopSocketLivenessWatchdog() {
+    if (this.socketLivenessTimer) {
+      clearInterval(this.socketLivenessTimer);
+      this.socketLivenessTimer = undefined;
+    }
+  }
+
+  // Manual close for a zombie socket: bring stateConnection/DB back to the
+  // truth and go through the normal reconnect path. Mirrors what the lost
+  // 'close' connection.update would have done.
+  private async forceZombieRecovery() {
+    this.logger.error({
+      message: 'Zombie socket detected — forcing close and reconnecting',
+      instanceName: this.instance.name,
+    });
+
+    this.stopUnavailablePresenceKeepAlive();
+    this.stateConnection = { state: 'close', statusReason: DisconnectReason.connectionLost };
+
+    try {
+      this.client?.ws?.close();
+      this.client?.end(new Error('Zombie socket recovery'));
+    } catch {
+      // socket already dead — that's the point
+    }
+
+    try {
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: {
+          connectionStatus: 'close',
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: DisconnectReason.connectionLost,
+          disconnectionObject: JSON.stringify({ error: 'zombie socket recovery (liveness watchdog)' }),
+        },
+      });
+    } catch (error) {
+      this.logger.error({ message: 'Failed to persist zombie recovery state', error });
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+
+    this.scheduleReconnect();
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
@@ -1840,7 +1940,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private eventHandler() {
     this.client.ev.process(async (events) => {
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+      // connection.update drives stateConnection and reconnection, so it is
+      // handled OUTSIDE the serialized queue: a single hung handler used to
+      // freeze the queue and leave a zombie instance — state stuck on 'open',
+      // socket dead, the 'close' never processed, no reconnect ever scheduled
+      // (incident 2026-08-17, instance f880ba41).
+      if (events['connection.update'] && !this.endSession) {
+        this.connectionUpdate(events['connection.update']).catch((error) =>
+          this.logger.error({ message: 'connectionUpdate failed', error }),
+        );
+      }
+
+      this.eventProcessingQueue = this.eventProcessingQueue.then(() => {
+        const batch = (async () => {
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
@@ -1863,10 +1975,6 @@ export class BaileysStartupService extends ChannelStartupService {
               }
 
               this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
             }
 
             if (events['creds.update']) {
@@ -1969,6 +2077,26 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (error) {
           this.logger.error(error);
         }
+        })();
+
+        // A batch that never resolves must not freeze the queue forever — the
+        // hung handler keeps running detached while the queue moves on, so
+        // later events (messages, receipts) still get processed.
+        let stallTimer: NodeJS.Timeout | undefined;
+        const stall = new Promise<void>((resolve) => {
+          stallTimer = setTimeout(() => {
+            this.logger.error({
+              message: 'Event batch stalled beyond timeout — advancing queue',
+              events: Object.keys(events),
+              instanceName: this.instance.name,
+            });
+            resolve();
+          }, BaileysStartupService.EVENT_BATCH_TIMEOUT_MS);
+        });
+
+        return Promise.race([batch, stall]).finally(() => {
+          if (stallTimer) clearTimeout(stallTimer);
+        });
       });
     });
   }

@@ -375,6 +375,13 @@ export class InstanceController {
 
         instance.client?.ws?.close();
         instance.client?.end(new Error('restart'));
+        // end() emits the 'close' connection.update asynchronously. Without
+        // waiting for it, connectToWhatsapp reads the stale 'open' and returns
+        // early — the caller gets a 200 with state 'open' and no QR even though
+        // the socket is already dead (zombie restart, incident 2026-08-17).
+        for (let i = 0; i < 10 && instance.connectionStatus?.state === 'open'; i++) {
+          await new Promise((r) => setTimeout(r, 300));
+        }
         return await this.connectToWhatsapp({ instanceName });
       }
 
