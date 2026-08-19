@@ -632,7 +632,26 @@ export class BaileysStartupService extends ChannelStartupService {
       // Connection is up: the slot did its job, hand it to the next in line.
       this.freeReconnectSlot();
 
-      this.startUnavailablePresenceKeepAlive();
+      // KEEPALIVE DE PRESENCE DESLIGADO (19/08/2026). Ele mandava sendPresenceUpdate('unavailable')
+      // a cada 15s em TODA instância conectada — ~4 nós/min por instância, ~1.350/min na frota —
+      // e o WhatsApp respondeu com stream:error em escala. Medido nos logs, comparando a hora
+      // anterior ao deploy (17:00) com a seguinte (19:00), contando `evaluating reconnection` por
+      // statusCode (500 = stream:error sem code, o default do Baileys):
+      //
+      //   whatsapp-1: 500 de   1 -> 94   (e 408 de 57 -> 4)
+      //   whatsapp-3: 500 de   0 -> 87
+      //   whatsapp-4: 500 de  12 -> 140  (e 408 de 104 -> 4)
+      //
+      // O efeito prático foi conta de atendimento entrando e saindo do ar. O watchdog está
+      // descartado como causa: zero `Zombie socket detected` e zero `Socket liveness check failed`
+      // nos três hosts no mesmo período.
+      //
+      // O objetivo do keepalive segue válido (iPhone parava de receber push notification quando o
+      // companion aparecia online), e `markOnlineOnConnect: this.localSettings.alwaysOnline === true`
+      // permanece — é ele que resolve o caso do "Finished syncing" sem custo de tráfego. O que não
+      // se sustenta é o intervalo de 15s. Reintroduzir só com medição: intervalo em minutos, atrás
+      // de flag, e comparando a taxa de 500 antes e depois.
+      // this.startUnavailablePresenceKeepAlive();
       this.startSocketLivenessWatchdog();
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
