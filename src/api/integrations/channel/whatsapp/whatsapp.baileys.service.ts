@@ -414,7 +414,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
     // Enhanced logging for connection updates
     const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-    this.logger.info({
+    const update = {
       message: 'Connection update received',
       connection,
       hasQr: !!qr,
@@ -422,7 +422,19 @@ export class BaileysStartupService extends ChannelStartupService {
       instanceName: this.instance.name,
       isDeleting: this.isDeleting,
       endSession: this.endSession,
-    });
+    };
+
+    // O keepalive de presence faz o Baileys emitir um connection.update só com
+    // { isOnline } a cada 15s (Socket/chats.js: ev.emit('connection.update', ...)
+    // no sendPresenceUpdate) — sem connection, sem qr e sem statusCode. Em INFO isso
+    // dava 4 linhas/min por instância conectada: ~1,3 mil/min na frota de ~337, perto
+    // de 2 milhões de linhas por dia, e já houve incidente de disco por log (20/05).
+    // O no-op vai para verbose; INFO fica com as transições que importam.
+    if (connection || qr || statusCode) {
+      this.logger.info(update);
+    } else {
+      this.logger.verbose(update);
+    }
 
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
