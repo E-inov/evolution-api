@@ -499,7 +499,14 @@ export class BaileysStartupService extends ChannelStartupService {
       // This prevents infinite loop that blocks QR code generation
       const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
 
-      if (isInitialConnection) {
+      // Código terminal (401 loggedOut, 403 forbidden...) NÃO pode ser engolido pelo guard
+      // de conexão inicial: é a sessão salva que morreu (aparelho desvinculado offline), não
+      // um close pré-QR. O return silencioso aqui deixava o banco com connectionStatus=open,
+      // nenhum evento era publicado e o CRM ficava em 'connecting' para sempre (caso medido:
+      // conta parada desde 13/07). Seguindo adiante, o fluxo terminal padrão faz o certo:
+      // publica STATUS_INSTANCE/CONNECTION_UPDATE, marca close no banco e o logout.instance
+      // limpa as credenciais mortas — o próximo connect vai direto para a geração de QR.
+      if (isInitialConnection && !codesToNotReconnect.includes(statusCode)) {
         this.logger.info('Initial connection closed, waiting for QR code generation...');
         return;
       }
