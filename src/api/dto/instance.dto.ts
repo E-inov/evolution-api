@@ -52,6 +52,13 @@ export class InstanceDto extends IntegrationDto {
   chatwootSignMsg?: boolean;
   chatwootToken?: string;
   chatwootUrl?: string;
+  /**
+   * `DELETE /instance/delete/:instance?force=true` — aceita apagar a instancia mesmo que o
+   * logout falhe, assumindo o dispositivo orfao na conta do cliente. Sem isso o delete
+   * ABORTA quando o WhatsApp nao confirma a remocao (issue cnpjbiz#2433). Query param chega
+   * como string via `dataValidate`, entao 'true' tambem vale.
+   */
+  force?: boolean;
 }
 
 export class SetPresenceDto {
