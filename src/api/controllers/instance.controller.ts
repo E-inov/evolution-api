@@ -1,4 +1,5 @@
 import { InstanceDto, SetPresenceDto } from '@api/dto/instance.dto';
+import { LogoutFailedError } from '@api/integrations/channel/whatsapp/errors/logout-failed.error';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -9,7 +10,12 @@ import { SettingsService } from '@api/services/settings.service';
 import { Events, Integration, wa } from '@api/types/wa.types';
 import { Auth, Chatwoot, ConfigService, HttpServer, WaBusiness } from '@config/env.config';
 import { Logger } from '@config/logger.config';
-import { BadRequestException, InternalServerErrorException, UnauthorizedException } from '@exceptions';
+import {
+  BadRequestException,
+  ConflictException,
+  InternalServerErrorException,
+  UnauthorizedException,
+} from '@exceptions';
 import { delay } from 'baileys';
 import { isArray, isURL } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
@@ -466,6 +472,14 @@ export class InstanceController {
     return await this.waMonitor.waInstances[instanceName].setPresence(data);
   }
 
+  /**
+   * Desvincula o dispositivo no WhatsApp.
+   *
+   * Falha de logout devolve 409 (nao 500 nem `SUCCESS` falso): a instancia segue de pe com
+   * as credenciais intactas e a operacao pode ser repetida quando o socket estabilizar.
+   * Antes desta issue (cnpjbiz#2433) `logoutInstance()` engolia a excecao e este metodo
+   * devolvia `SUCCESS` — o `catch` nunca disparava.
+   */
   public async logout({ instanceName }: InstanceDto) {
     const { instance } = await this.connectionState({ instanceName });
 
@@ -478,18 +492,69 @@ export class InstanceController {
 
       return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
     } catch (error) {
+      if (error instanceof LogoutFailedError) {
+        throw new ConflictException(error.message);
+      }
+
       throw new InternalServerErrorException(error.toString());
     }
   }
 
-  public async deleteInstance({ instanceName }: InstanceDto) {
+  /**
+   * Apaga a instancia — e SO apaga depois de o WhatsApp confirmar a remocao do dispositivo.
+   *
+   * Regras (issue cnpjbiz#2433):
+   * - `connecting`: recusa com 409. O socket esta no meio do handshake, o logout falharia
+   *   com `428 Connection Closed` e o dispositivo ficaria orfao. Foi exatamente o estado do
+   *   caso medido em 21/08/2026.
+   * - `open`: faz logout; se o logout falhar, ABORTA e devolve 409 — a instancia e as
+   *   credenciais ficam preservadas para a proxima tentativa.
+   * - `force=true`: apaga de qualquer forma, registrando em WARN que um dispositivo orfao
+   *   pode ter sido criado. Necessario para os quadros em que o logout e impossivel por
+   *   definicao — conta banida (403) ou aparelho fora do ar (ver cnpjbiz#2427).
+   *
+   * Apagar deixando orfao deixa de ser o comportamento padrao e silencioso.
+   */
+  public async deleteInstance({ instanceName, force }: InstanceDto) {
     const { instance } = await this.connectionState({ instanceName });
+    const forced = force === true || (force as unknown as string) === 'true';
+
+    if (instance.state === 'connecting' && !forced) {
+      throw new ConflictException(
+        `logout_failed: a instancia "${instanceName}" esta em 'connecting' (handshake em andamento). ` +
+          'Apagar agora deixaria um dispositivo orfao na conta do cliente. Tente novamente em alguns segundos ' +
+          'ou repita com force=true para aceitar o orfao.',
+      );
+    }
+
     try {
       const waInstances = this.waMonitor.waInstances[instanceName];
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+        try {
+          await this.logout({ instanceName });
+        } catch (error) {
+          if (!forced) {
+            throw error;
+          }
+
+          // `ownerJid`/`wuid` identificam o NUMERO afetado, nao so o hash da instancia: um
+          // orfao e irreversivel, e sem o numero no log ninguem descobre depois qual conta de
+          // qual cliente ficou com o dispositivo preso. Este WARN e a unica trilha de
+          // auditoria de um `force` — inclusive se ele vier de um falso positivo de quem
+          // chamou (ex.: takeover de numero classificado errado).
+          this.logger.warn({
+            message: 'force=true: instancia apagada apesar da falha de logout — DISPOSITIVO ORFAO na conta do cliente',
+            instanceName,
+            instanceId: waInstances?.instanceId,
+            ownerJid: waInstances?.instance?.ownerJid,
+            wuid: waInstances?.instance?.wuid,
+            number: waInstances?.instance?.number,
+            state: instance.state,
+            errorMessage: error?.message ?? String(error),
+          });
+        }
       }
 
       try {
@@ -504,6 +569,14 @@ export class InstanceController {
       this.eventEmitter.emit('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
     } catch (error) {
+      // 409 do logout falho sobe intacto: virar 400 aqui apagaria a distincao entre
+      // "nao apaguei para nao criar orfao" (retentavel) e erro de requisicao.
+      // 409 literal de proposito: importar HttpStatus de '@api/routes/index.router' fecharia
+      // um ciclo index.router -> instance.router -> server.module -> este controller.
+      if (error?.status === 409) {
+        throw error;
+      }
+
       throw new BadRequestException(error.toString());
     }
   }

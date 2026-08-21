@@ -52,6 +52,7 @@ import {
   StatusMessage,
   TypeButton,
 } from '@api/dto/sendMessage.dto';
+import { LogoutFailedError } from '@api/integrations/channel/whatsapp/errors/logout-failed.error';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
@@ -322,6 +323,18 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.stateConnection;
   }
 
+  /**
+   * Desvincula o dispositivo no WhatsApp e SO ENTAO apaga as credenciais locais.
+   *
+   * LANCA `LogoutFailedError` quando `client.logout()` falha, em vez de seguir para o
+   * cleanup das credenciais (issue cnpjbiz#2433). Engolir essa falha era o que criava
+   * dispositivo orfao PERMANENTE: o estado local desaparecia enquanto o companion
+   * continuava registrado na conta do cliente, sem nenhuma API para remove-lo depois.
+   * Quem chama decide o que fazer com a falha — `deleteInstance()` aborta o delete, e so
+   * um `force` explicito aceita deixar o orfao (conta banida, onde o logout e impossivel).
+   *
+   * O cleanup do SOCKET continua acontecendo sempre: e local e sempre seguro.
+   */
   public async logoutInstance() {
     // Mark instance as deleting to prevent reconnection attempts
     this.isDeleting = true;
@@ -333,10 +346,22 @@ export class BaileysStartupService extends ChannelStartupService {
     this.messageProcessor.onDestroy();
 
     if (this.client) {
+      let logoutError: any = null;
+
       try {
         await this.client.logout('Log out instance: ' + this.instanceName);
       } catch (error) {
-        this.logger.error({ message: 'Error during logout', error });
+        logoutError = error;
+
+        // `logger.error({ error })` serializava o Boom como `{}` e deixava quem investiga
+        // sem a causa. Achatar os campos que importam (Correcao 4 da issue).
+        this.logger.error({
+          message: 'Error during logout — dispositivo pode ter ficado ORFAO na conta do cliente',
+          instanceName: this.instanceName,
+          errorMessage: error?.message ?? String(error),
+          boomStatusCode: error?.output?.statusCode,
+          stack: error?.stack,
+        });
       }
 
       // Improved socket cleanup
@@ -344,7 +369,28 @@ export class BaileysStartupService extends ChannelStartupService {
         this.client.ws?.close();
         this.client.end(new Error('Instance logout'));
       } catch (error) {
-        this.logger.error({ message: 'Error during socket cleanup', error });
+        this.logger.error({
+          message: 'Error during socket cleanup',
+          instanceName: this.instanceName,
+          errorMessage: error?.message ?? String(error),
+          stack: error?.stack,
+        });
+      }
+
+      if (logoutError) {
+        // Antes do `removeCreds()`: credencial local apagada sem remocao no servidor do
+        // WhatsApp e exatamente o que cria o orfao.
+        this.stateConnection.state = 'close';
+
+        // Devolve a instancia ao estado operacional. Abortar o delete existe para PRESERVAR
+        // a sessao, e `isDeleting` (que nunca era reposto em lugar nenhum) bloqueia
+        // `scheduleReconnect` — sem isto a sessao ficaria de pe mas incapaz de reconectar ate
+        // o processo reiniciar, trocando o orfao permanente por uma conexao morta. O
+        // messageProcessor se recupera sozinho: `mount()` recria o Subject completado.
+        this.isDeleting = false;
+        this.endSession = false;
+
+        throw new LogoutFailedError(this.instanceName, logoutError);
       }
     }
 
