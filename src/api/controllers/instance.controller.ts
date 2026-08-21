@@ -539,9 +539,18 @@ export class InstanceController {
             throw error;
           }
 
+          // `ownerJid`/`wuid` identificam o NUMERO afetado, nao so o hash da instancia: um
+          // orfao e irreversivel, e sem o numero no log ninguem descobre depois qual conta de
+          // qual cliente ficou com o dispositivo preso. Este WARN e a unica trilha de
+          // auditoria de um `force` — inclusive se ele vier de um falso positivo de quem
+          // chamou (ex.: takeover de numero classificado errado).
           this.logger.warn({
             message: 'force=true: instancia apagada apesar da falha de logout — DISPOSITIVO ORFAO na conta do cliente',
             instanceName,
+            instanceId: waInstances?.instanceId,
+            ownerJid: waInstances?.instance?.ownerJid,
+            wuid: waInstances?.instance?.wuid,
+            number: waInstances?.instance?.number,
             state: instance.state,
             errorMessage: error?.message ?? String(error),
           });
