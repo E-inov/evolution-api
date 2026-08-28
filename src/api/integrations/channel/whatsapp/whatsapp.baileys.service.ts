@@ -1209,6 +1209,43 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.eventHandler();
 
+    // ------------------------------------------------------------------
+    // Close BRUTO do WebSocket, antes de o Baileys normalizar tudo em 428.
+    //
+    // Por que isto existe: `DisconnectReason.connectionClosed` (428) é o
+    // destino de TRÊS caminhos diferentes no Baileys — `ws.on('close')`,
+    // `CB:xmlstreamend` (o WhatsApp encerrando o stream) e o fallback. Ou
+    // seja, ver 428 no `connection.update` NÃO diz se quem fechou foi o
+    // WhatsApp ou a camada de transporte/proxy, e era exatamente essa a
+    // dúvida nas ondas de desconexão em massa da frota.
+    //
+    // O close code do WebSocket separa os casos:
+    //   1006 = fechamento anormal, SEM Close frame -> transporte caiu
+    //          (proxy/rede). É o que se espera de um RST/FIN no túnel.
+    //   1000/1001 + frame = encerramento ordenado -> o outro lado decidiu
+    //          fechar, o que aponta para o servidor do WhatsApp.
+    // `hadError` do socket TCP e o par bytes lidos/escritos completam o
+    // quadro. Só logamos no fechamento, então o custo é nulo em regime.
+    this.client.ws.on('close', (code: number, reason: Buffer) => {
+      this.logger.warn({
+        message: 'RAW_WS_CLOSE',
+        instanceName: this.instance.name,
+        wsCloseCode: code,
+        wsCloseReason: reason?.toString()?.slice(0, 120) || '',
+        openedAtMs: this.lastConnectionOpenAt ?? null,
+        ageMs: this.lastConnectionOpenAt ? Date.now() - this.lastConnectionOpenAt : null,
+      });
+    });
+
+    this.client.ws.on('error', (err: any) => {
+      this.logger.warn({
+        message: 'RAW_WS_ERROR',
+        instanceName: this.instance.name,
+        err: err?.message?.slice(0, 160) ?? String(err).slice(0, 160),
+        code: err?.code ?? null,
+      });
+    });
+
     this.client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
       const payload = { event: 'CB:call', packet: packet };
