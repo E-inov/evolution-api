@@ -1,0 +1,21 @@
+# Projeto Node que roda em Linux: LF em tudo, sempre.
+#
+# Sem isto, `core.autocrlf=true` (comum em Windows/WSL) converte na SAÍDA e quebra
+# duas coisas de forma difícil de diagnosticar:
+#   - os hooks do husky: `commit-msg` recebia `$1` com `\r` e o commitlint procurava
+#     por `.git/COMMIT_EDITMSG\r`, falhando com ENOENT;
+#   - arquivos `.ts`: o CRLF virava erro de prettier (`Delete ␍⏎`), derrubando o
+#     `lint:check` e, com ele, o pre-push.
+#
+# O repositório sempre guardou LF; o problema era só a conversão no checkout.
+* text=auto eol=lf
+
+# Binários não passam por conversão nenhuma.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary

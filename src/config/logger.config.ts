@@ -64,7 +64,7 @@ export class Logger {
 
   // Cache estático dos níveis permitidos — evita alocar array a cada log
   private static allowedTypes: Set<Type> | null = null;
-ou
+  ou;
   constructor(context = 'Logger') {
     this.context = context;
   }
@@ -108,7 +108,6 @@ ou
   }
 
   private console(value: any, type: Type) {
-
     if (!Logger.getAllowedTypes().has(type)) return;
 
     const typeValue = typeof value;
