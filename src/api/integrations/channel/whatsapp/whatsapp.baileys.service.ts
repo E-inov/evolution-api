@@ -811,8 +811,9 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Manual close for a zombie socket: bring stateConnection/DB back to the
-  // truth and go through the normal reconnect path. Mirrors what the lost
-  // 'close' connection.update would have done.
+  // truth and go through the normal reconnect path — o mesmo caminho de um close
+  // recuperável comum, que é SILENCIOSO (ver o `if (shouldReconnect)` do
+  // connectionUpdate: ele só agenda o reconnect, não publica connection.update).
   private async forceZombieRecovery() {
     this.logger.error({
       message: 'Zombie socket detected — forcing close and reconnecting',
@@ -843,7 +844,37 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.error({ message: 'Failed to persist zombie recovery state', error });
     }
 
-    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+    // NÃO publicamos `connection.update` com state=close aqui (issue cnpjbiz#2455).
+    //
+    // Este método é a recuperação de um socket zumbi: fechamos e reconectamos NÓS MESMOS,
+    // e o `open` volta em 3-8s (scheduleReconnect com RECONNECT_BACKOFF_BASE_MS=3000 + handshake).
+    // Anunciar um close que nós vamos desfazer fazia o CRM desistir da instância: ele consulta
+    // o estado ~1-2s depois, ainda dentro da janela, e reprovisiona — hash novo, host novo (o
+    // balanceamento troca de droplet) e QR novo. A instância antiga volta a `open` logo em
+    // seguida, viva e recebendo, mas nenhum cadastro a referencia mais: é o "ghost", com o
+    // cliente aparecendo Desconectado no CRM enquanto o WhatsApp funciona no aparelho.
+    //
+    // Medido na frota em 28/08/2026: dos ~4.100 closes internos do dia, apenas 30 foram
+    // publicados — 99,3% dos closes recuperáveis (428/408/500/515) já eram silenciosos por
+    // desenho. Os únicos `408` publicados (5 no wa-2, 2 no wa-3) eram exatamente os 7 zombie
+    // recoveries do dia, e TODOS os 5 rastreáveis viraram `instance.create` do CRM em 0-2s.
+    // 4 dos 5 ghosts com cliente desconectado no fim do dia nasceram por esta linha.
+    //
+    // O CRM não fica no escuro: o reconnect publica `connecting` e depois `open` (ambos no
+    // connectionUpdate), então a transição é informada pelos estados reais. E se o reconnect
+    // falhar de forma TERMINAL (401 loggedOut / 403 forbidden), o ramo normal de close publica
+    // o `close` com o código certo e o reprovisionamento acontece — que é o desejado ali.
+    //
+    // O `warn` abaixo mantém a rota visível no log (é o que o monitoramento da frota grepa),
+    // já que ela deixou de emitir evento. O statusReason é logado como CONSTANTE, não lido de
+    // `this.stateConnection`: o `client.end()` acima faz o Baileys emitir o seu próprio
+    // connection.update de close (com erro que não é Boom, logo statusCode indefinido), e esse
+    // handler pode ter sobrescrito o campo para o default 200 antes desta linha rodar.
+    this.logger.warn({
+      message: 'Zombie recovery: close NÃO publicado (reconectando por conta própria) — cnpjbiz#2455',
+      statusReason: DisconnectReason.connectionLost,
+      instanceName: this.instance.name,
+    });
 
     this.scheduleReconnect();
   }
