@@ -2,7 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { channelController } from '@api/server.module';
-import { Events, Integration } from '@api/types/wa.types';
+import { Events, Integration, wa } from '@api/types/wa.types';
 import { CacheConf, Chatwoot, ConfigService, Database, DelInstance, ProviderSession } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
@@ -127,7 +127,53 @@ export class WAMonitoringService {
       },
     });
 
-    return instances;
+    return instances.map((instance) => ({ ...instance, live: this.liveSignalsFor(instance.name) }));
+  }
+
+  /**
+   * Bloco `live` do `fetchInstances`: o estado que so existe na memoria do processo.
+   *
+   * ADITIVO — nenhum campo existente muda de nome ou de valor. Existe porque o
+   * registro do Prisma acima responde "qual foi o ultimo estado GRAVADO", nao "como
+   * esta agora": o close recuperavel (500/428/408/515) segue o ramo `shouldReconnect`
+   * do connectionUpdate, que nao publica evento e nao grava banco. Consequencias
+   * medidas na frota, todas fechadas por este bloco:
+   *
+   *   - `connectionStatus` mente nas duas direcoes (orfa desligada aparecendo `open`,
+   *     instancia `close` aparecendo `connecting`), e a unica leitura confiavel era
+   *     `GET /instance/connectionState/{uuid}` — uma chamada POR INSTANCIA, ~200 por
+   *     varredura da frota. Com `live.state` aqui, a varredura inteira sao 4 chamadas
+   *     (uma por host) sem enfraquecer a garantia: o dado vem da MESMA memoria que o
+   *     `connectionState` le, so chega junto.
+   *   - `disconnectionReasonCode` e residual: nunca e limpo no `open`, e como o
+   *     recuperavel nao persiste, ele so enxerga terminais (401/403/402/406) e o
+   *     `forceZombieRecovery` (constante 408). Medido em 02/09: 17 de 116 instancias
+   *     `open` (15%) carregavam carimbo antigo, o mais velho de 9 dias, e 100% eram
+   *     408. Classificar problema por aquele campo da falso positivo; `live` da a
+   *     resposta atual.
+   *
+   * `live` vem `null` para instancia que existe no banco e NAO esta carregada neste
+   * processo — informacao util por si (nao e o mesmo que estar `close`). Canais que
+   * nao expoem sinais (Business API, Evolution) tambem devolvem `null`, por isso o
+   * teste de capacidade em vez de acesso direto ao campo.
+   */
+  private liveSignalsFor(instanceName: string): wa.LiveSignals | null {
+    const instance = this.waInstances[instanceName];
+
+    if (typeof instance?.getLiveSignals !== 'function') {
+      return null;
+    }
+
+    try {
+      return instance.getLiveSignals();
+    } catch (error) {
+      // Um snapshot da frota nunca deve falhar por causa de UMA instancia em
+      // estado estranho: o `fetchInstances` e a fonte do reconcile, e devolver
+      // 500 aqui cegaria a varredura inteira.
+      this.logger.error({ message: 'Failed to read live signals (cnpjbiz#2457)', instanceName, error });
+
+      return null;
+    }
   }
 
   public async instanceInfoById(instanceId?: string, number?: string) {

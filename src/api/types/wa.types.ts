@@ -131,6 +131,29 @@ export declare namespace wa {
     statusReason?: number;
   };
 
+  /**
+   * Estado que existe SO na memoria do processo, servido no bloco `live` do
+   * `fetchInstances` (issue cnpjbiz#2457). Ver `getLiveSignals()` no
+   * `BaileysStartupService` para o porque de cada campo.
+   *
+   * `connectionAgeMs` e `null` fora do `open` (a idade seria do vinculo anterior) e
+   * `observedForMs` e `null` enquanto nao houve tentativa de conexao neste processo —
+   * nos dois casos o `null` significa "nao ha o que medir", nunca zero.
+   */
+  export type LiveSignals = {
+    state: WAConnectionState | 'refused' | null;
+    statusReason: number | null;
+    badSessionCloses: {
+      consecutive: number;
+      total: number;
+      inLoop: boolean;
+    };
+    reconnectAttempts: number;
+    isReconnecting: boolean;
+    connectionAgeMs: number | null;
+    observedForMs: number | null;
+  };
+
   export type StatusMessage = 'ERROR' | 'PENDING' | 'SERVER_ACK' | 'DELIVERY_ACK' | 'READ' | 'DELETED' | 'PLAYED';
 }
 

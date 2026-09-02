@@ -42,6 +42,14 @@ export class ChannelStartupService {
    */
   public holdReconnectSlot?: (release: () => void) => void;
 
+  /**
+   * Implemented by channels that keep connection state in memory (Baileys):
+   * returns the signals the database snapshot cannot answer, for the `live`
+   * block of fetchInstances. Channels without it report `live: null`.
+   * See getLiveSignals() in BaileysStartupService and issue cnpjbiz#2457.
+   */
+  public getLiveSignals?: () => wa.LiveSignals;
+
   public readonly instance: wa.Instance = {};
   public readonly localChatwoot: wa.LocalChatwoot = {};
   public readonly localProxy: wa.LocalProxy = {};
