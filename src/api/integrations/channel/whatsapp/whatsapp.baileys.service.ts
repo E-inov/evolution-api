@@ -263,6 +263,16 @@ export class BaileysStartupService extends ChannelStartupService {
   private reconnectAttempts = 0;
   private consecutiveBadSessionCloses = 0;
   private lastConnectionOpenAt?: number;
+  // Every badSession (500) close since this instance was loaded, never reset.
+  // `consecutiveBadSessionCloses` answers "is it losing the fight right now?"
+  // and is zeroed by 30s of stability; this one keeps the history, so a caller
+  // can tell "quiet because it is healthy" from "quiet because it just booted".
+  private badSessionClosesTotal = 0;
+  // When this instance object started being observed in THIS process. The
+  // counters above live in memory, so a pm2 restart zeroes them: without this
+  // timestamp a freshly booted instance reads 0 and looks healthy even while
+  // looping. See getLiveSignals().
+  private readonly observedSince = Date.now();
   // Set while this instance holds a slot in the process-wide reconnect gate.
   private releaseReconnectSlot?: () => void;
   private static readonly RECONNECT_BACKOFF_BASE_MS = 3000;
@@ -320,6 +330,48 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  /**
+   * Sinais que existem SO na memoria deste processo, para o `fetchInstances` poder
+   * responder "como esta agora" (issue cnpjbiz#2457).
+   *
+   * Por que isto existe: o `instanceInfo` devolve o registro do Prisma, e ali
+   * `connectionStatus` e o ultimo valor GRAVADO — o close recuperavel (500/428/408)
+   * segue o ramo `shouldReconnect`, que nao publica evento e nao grava nada. Logo o
+   * snapshot mente nas duas direcoes (ja mostrou orfa desligada como `open` e
+   * instancia `close` como `connecting`), e o unico jeito de saber o estado real era
+   * `GET /instance/connectionState/{uuid}` — uma chamada POR INSTANCIA, ~200 por
+   * varredura da frota.
+   *
+   * `badSessionCloses` e o discriminador da disputa de credencial: duas instancias do
+   * mesmo numero `open` ao mesmo tempo recebem e confirmam o MESMO trafego, entao
+   * recencia de ack nao separa a saudavel da perdedora (medido no par 5815: acks
+   * empatados em 21, e a duplicata acumulava 190 closes 500 contra 0 da que segurava a
+   * sessao). O contador `consecutive` nao zera no `open` de proposito — sobrevive ao
+   * flap, que e justamente o quadro — e zera em close de outro statusCode, o que o
+   * torna imune a onda de gateway (428/408 em massa).
+   *
+   * `observedForMs` e obrigatorio para ler os contadores: eles vivem em memoria, e um
+   * `pm2 restart` zera. Sem essa janela, num par cross-host (a acc 5824 tinha orfa no
+   * wa-3 e referencia no wa-4) o host que subiu ha 2 min le 0 e parece o saudavel
+   * mesmo estando em loop — um zero que significa "nao medi" lido como "nao
+   * aconteceu". Quem compara contadores DEVE exigir janela comparavel nos dois lados.
+   */
+  public getLiveSignals() {
+    return {
+      state: this.stateConnection?.state ?? null,
+      statusReason: this.stateConnection?.statusReason ?? null,
+      badSessionCloses: {
+        consecutive: this.consecutiveBadSessionCloses,
+        total: this.badSessionClosesTotal,
+        inLoop: this.consecutiveBadSessionCloses >= BaileysStartupService.BAD_SESSION_MAX_RECONNECTS,
+      },
+      reconnectAttempts: this.reconnectAttempts,
+      isReconnecting: this.isReconnecting,
+      connectionAgeMs: this.lastConnectionOpenAt ? Date.now() - this.lastConnectionOpenAt : null,
+      observedForMs: Date.now() - this.observedSince,
+    };
   }
 
   /**
@@ -613,6 +665,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // on its own. The reconnect decision itself is unchanged from before.
       if (statusCode === DisconnectReason.badSession) {
         this.consecutiveBadSessionCloses += 1;
+        this.badSessionClosesTotal += 1;
       } else {
         this.consecutiveBadSessionCloses = 0;
       }
