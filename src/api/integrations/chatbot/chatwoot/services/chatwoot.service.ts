@@ -641,7 +641,7 @@ export class ChatwootService {
     const isLid = body.key.addressingMode === 'lid';
     const isGroup = body.key.remoteJid.endsWith('@g.us');
     let phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
-    let { remoteJid } = body.key;
+    const { remoteJid } = body.key;
 
     // CORREÇÃO LID: Resolve LID para número normal antes de processar
     if (isLid && !isGroup) {
@@ -974,9 +974,7 @@ export class ChatwootService {
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
     // Filtra valores null/undefined do content_attributes para evitar erro 406
-    const filteredReplyToIds = Object.fromEntries(
-      Object.entries(replyToIds).filter(([_, value]) => value != null)
-    );
+    const filteredReplyToIds = Object.fromEntries(Object.entries(replyToIds).filter(([, value]) => value != null));
 
     // Monta o objeto data, incluindo content_attributes apenas se houver dados válidos
     const messageData: any = {
@@ -1132,9 +1130,7 @@ export class ChatwootService {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
 
       // Filtra valores null/undefined antes de enviar
-      const filteredReplyToIds = Object.fromEntries(
-        Object.entries(replyToIds).filter(([_, value]) => value != null)
-      );
+      const filteredReplyToIds = Object.fromEntries(Object.entries(replyToIds).filter(([, value]) => value != null));
 
       if (Object.keys(filteredReplyToIds).length > 0) {
         const contentAttrs = JSON.stringify(filteredReplyToIds);
@@ -1841,32 +1837,32 @@ export class ChatwootService {
   }
 
   private getTypeMessage(msg: any) {
-  const types = {
-    conversation: msg.conversation,
-    imageMessage: msg.imageMessage?.caption,
-    videoMessage: msg.videoMessage?.caption,
-    extendedTextMessage: msg.extendedTextMessage?.text,
-    messageContextInfo: msg.messageContextInfo?.stanzaId,
-    stickerMessage: undefined,
-    documentMessage: msg.documentMessage?.caption,
-    documentWithCaptionMessage: msg.documentWithCaptionMessage?.message?.documentMessage?.caption,
-    audioMessage: msg.audioMessage ? (msg.audioMessage.caption ?? '') : undefined,
-    contactMessage: msg.contactMessage?.vcard,
-    contactsArrayMessage: msg.contactsArrayMessage,
-    locationMessage: msg.locationMessage,
-    liveLocationMessage: msg.liveLocationMessage,
-    listMessage: msg.listMessage,
-    listResponseMessage: msg.listResponseMessage,
-    orderMessage: msg.orderMessage,
-    quotedProductMessage: msg.contextInfo?.quotedMessage?.productMessage,
-    viewOnceMessageV2:
-      msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
-      msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
-      msg?.message?.viewOnceMessageV2?.message?.audioMessage?.url,
-  };
+    const types = {
+      conversation: msg.conversation,
+      imageMessage: msg.imageMessage?.caption,
+      videoMessage: msg.videoMessage?.caption,
+      extendedTextMessage: msg.extendedTextMessage?.text,
+      messageContextInfo: msg.messageContextInfo?.stanzaId,
+      stickerMessage: undefined,
+      documentMessage: msg.documentMessage?.caption,
+      documentWithCaptionMessage: msg.documentWithCaptionMessage?.message?.documentMessage?.caption,
+      audioMessage: msg.audioMessage ? (msg.audioMessage.caption ?? '') : undefined,
+      contactMessage: msg.contactMessage?.vcard,
+      contactsArrayMessage: msg.contactsArrayMessage,
+      locationMessage: msg.locationMessage,
+      liveLocationMessage: msg.liveLocationMessage,
+      listMessage: msg.listMessage,
+      listResponseMessage: msg.listResponseMessage,
+      orderMessage: msg.orderMessage,
+      quotedProductMessage: msg.contextInfo?.quotedMessage?.productMessage,
+      viewOnceMessageV2:
+        msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
+        msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
+        msg?.message?.viewOnceMessageV2?.message?.audioMessage?.url,
+    };
 
-  return types;
-}
+    return types;
+  }
 
   private getMessageContent(types: any) {
     const typeKey = Object.keys(types).find((key) => types[key] !== undefined);
@@ -1894,39 +1890,39 @@ export class ChatwootService {
       this.processedOrderIds.set(result.orderId, now);
     }
     // Tratamento de Produto citado (WhatsApp Desktop)
-if (typeKey === 'quotedProductMessage' && result?.product) {
-  const product = result.product;
+    if (typeKey === 'quotedProductMessage' && result?.product) {
+      const product = result.product;
 
-  // Extrai preço
-  let rawPrice = 0;
-  const amount = product.priceAmount1000;
+      // Extrai preço
+      let rawPrice = 0;
+      const amount = product.priceAmount1000;
 
-  if (Long.isLong(amount)) {
-    rawPrice = amount.toNumber();
-  } else if (amount && typeof amount === 'object' && 'low' in amount) {
-    rawPrice = Long.fromValue(amount).toNumber();
-  } else if (typeof amount === 'number') {
-    rawPrice = amount;
-  }
+      if (Long.isLong(amount)) {
+        rawPrice = amount.toNumber();
+      } else if (amount && typeof amount === 'object' && 'low' in amount) {
+        rawPrice = Long.fromValue(amount).toNumber();
+      } else if (typeof amount === 'number') {
+        rawPrice = amount;
+      }
 
-  const price = (rawPrice / 1000).toLocaleString('pt-BR', {
-    style: 'currency',
-    currency: product.currencyCode || 'BRL',
-  });
+      const price = (rawPrice / 1000).toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: product.currencyCode || 'BRL',
+      });
 
-  const productTitle = product.title || 'Produto do catálogo';
-  const productId = product.productId || 'N/A';
+      const productTitle = product.title || 'Produto do catálogo';
+      const productId = product.productId || 'N/A';
 
-  return (
-    `🛒 *PRODUTO DO CATÁLOGO (Desktop)*\n` +
-    `━━━━━━━━━━━━━━━━━━━━━\n` +
-    `📦 *Produto:* ${productTitle}\n` +
-    `💰 *Preço:* ${price}\n` +
-    `🆔 *Código:* ${productId}\n` +
-    `━━━━━━━━━━━━━━━━━━━━━\n` +
-    `_Cliente perguntou: "${types.conversation || 'Me envia este produto?'}"_`
-  );
-}
+      return (
+        `🛒 *PRODUTO DO CATÁLOGO (Desktop)*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 *Produto:* ${productTitle}\n` +
+        `💰 *Preço:* ${price}\n` +
+        `🆔 *Código:* ${productId}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `_Cliente perguntou: "${types.conversation || 'Me envia este produto?'}"_`
+      );
+    }
     if (typeKey === 'orderMessage') {
       // Extrai o valor - pode ser Long, objeto {low, high}, ou número direto
       let rawPrice = 0;

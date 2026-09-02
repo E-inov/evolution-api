@@ -53,7 +53,6 @@ import {
   TypeButton,
 } from '@api/dto/sendMessage.dto';
 import { LogoutFailedError } from '@api/integrations/channel/whatsapp/errors/logout-failed.error';
-import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
@@ -1070,10 +1069,14 @@ export class BaileysStartupService extends ChannelStartupService {
         this.client.ws?.removeAllListeners();
         try {
           this.client.ws?.close();
-        } catch {}
+        } catch {
+          // socket já morto — fechar de novo não é erro, é o objetivo
+        }
         try {
           this.client.end(new Error('Reconnecting'));
-        } catch {}
+        } catch {
+          // idem: o cliente antigo pode já estar encerrado
+        }
       } catch (error) {
         this.logger.error({ message: 'Error cleaning up previous client', error });
       }
@@ -1489,8 +1492,6 @@ export class BaileysStartupService extends ChannelStartupService {
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
-        const instance: InstanceDto = { instanceName: this.instance.name };
-
         let timestampLimitToImport = null;
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
@@ -1861,8 +1862,6 @@ export class BaileysStartupService extends ChannelStartupService {
     'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
       this.logger.verbose(`Update messages ${JSON.stringify(args, undefined, 2)}`);
 
-      const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
-
       for await (const { key, update } of args) {
         const keyAny = key as any;
         if (keyAny.remoteJid) {
@@ -2143,7 +2142,6 @@ export class BaileysStartupService extends ChannelStartupService {
 
               if (events['messaging-history.set']) {
                 const payload = events['messaging-history.set'];
-                // @ts-ignore
                 await this.messageHandle['messaging-history.set'](payload);
               }
 

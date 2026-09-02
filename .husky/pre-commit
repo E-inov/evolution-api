@@ -1,1 +1,5 @@
-npx lint-staged
+# `npm exec --no` em vez de `npx`: o npx tenta resolver no registry e falha de forma
+# intermitente com `ETARGET undefined@lint-staged`, mesmo com o pacote instalado
+# localmente — e hook que falha por rede treina todo mundo a usar `--no-verify`.
+# O `--no` garante que nada é instalado: ou usa o binário local, ou falha alto.
+npm exec --no -- lint-staged
