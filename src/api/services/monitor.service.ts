@@ -2,7 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { channelController } from '@api/server.module';
-import { Events, Integration } from '@api/types/wa.types';
+import { Events, Integration, wa } from '@api/types/wa.types';
 import { CacheConf, Chatwoot, ConfigService, Database, DelInstance, ProviderSession } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
@@ -157,10 +157,10 @@ export class WAMonitoringService {
    * nao expoem sinais (Business API, Evolution) tambem devolvem `null`, por isso o
    * teste de capacidade em vez de acesso direto ao campo.
    */
-  private liveSignalsFor(instanceName: string) {
-    const instance = this.waInstances[instanceName] as any;
+  private liveSignalsFor(instanceName: string): wa.LiveSignals | null {
+    const instance = this.waInstances[instanceName];
 
-    if (!instance || typeof instance.getLiveSignals !== 'function') {
+    if (typeof instance?.getLiveSignals !== 'function') {
       return null;
     }
 

@@ -268,11 +268,16 @@ export class BaileysStartupService extends ChannelStartupService {
   // and is zeroed by 30s of stability; this one keeps the history, so a caller
   // can tell "quiet because it is healthy" from "quiet because it just booted".
   private badSessionClosesTotal = 0;
-  // When this instance object started being observed in THIS process. The
-  // counters above live in memory, so a pm2 restart zeroes them: without this
-  // timestamp a freshly booted instance reads 0 and looks healthy even while
-  // looping. See getLiveSignals().
-  private readonly observedSince = Date.now();
+  // When this instance started being observed in THIS process — set on the first
+  // connectToWhatsapp(), NOT on construction. The counters above live in memory,
+  // so a pm2 restart zeroes them and a reader needs the window to tell "quiet
+  // because healthy" from "quiet because it just booted". Construction is the
+  // wrong mark: on boot the object is registered and can then wait minutes in
+  // the reconnectGate queue, and an instance that is `close` in the database
+  // never connects at all — both would report a large window over counters that
+  // were never given a chance to move. Stays undefined (reported as null) until
+  // there is a socket attempt to observe. See getLiveSignals().
+  private observedSince?: number;
   // Set while this instance holds a slot in the process-wide reconnect gate.
   private releaseReconnectSlot?: () => void;
   private static readonly RECONNECT_BACKOFF_BASE_MS = 3000;
@@ -352,26 +357,63 @@ export class BaileysStartupService extends ChannelStartupService {
    * flap, que e justamente o quadro — e zera em close de outro statusCode, o que o
    * torna imune a onda de gateway (428/408 em massa).
    *
+   * O RESET E PREGUICOSO: `scheduleReconnect()` so o avalia no PROXIMO close, entao o
+   * campo cru fica congelado enquanto a instancia esta de pe. Uma instancia que saiu de
+   * um loop com 7 closes e ficou `open` por dias continuaria respondendo
+   * `consecutive: 7, inLoop: true` — o oposto de "quem segura a sessao le 0", que e a
+   * leitura que este bloco promete. Por isso projetamos o reset aqui, SEM mutar estado:
+   * enquanto a sessao esta `open` alem da janela de estabilidade, o que o
+   * `scheduleReconnect` faria no proximo close ja e refletido na leitura. A condicao
+   * mora em `stayedUpLongEnoughToReset()`, compartilhada com ele, para as duas nao
+   * divergirem.
+   *
    * `observedForMs` e obrigatorio para ler os contadores: eles vivem em memoria, e um
    * `pm2 restart` zera. Sem essa janela, num par cross-host (a acc 5824 tinha orfa no
    * wa-3 e referencia no wa-4) o host que subiu ha 2 min le 0 e parece o saudavel
    * mesmo estando em loop — um zero que significa "nao medi" lido como "nao
    * aconteceu". Quem compara contadores DEVE exigir janela comparavel nos dois lados.
+   * Vem `null` enquanto nao houve nenhuma tentativa de conexao neste processo: no boot
+   * o objeto entra no `waInstances` e pode esperar minutos na fila do `reconnectGate`,
+   * e instancia `close` no banco nunca conecta — contar desde a construcao daria
+   * janela enorme com contadores em zero, que e o falso "nao aconteceu" que o campo
+   * existe para impedir.
    */
-  public getLiveSignals() {
+  public getLiveSignals = (): wa.LiveSignals => {
+    const state = this.stateConnection?.state ?? null;
+    // Um `lastConnectionOpenAt` antigo nao diz nada sobre a conexao ATUAL: ele so e
+    // escrito no `open` e nunca limpo, entao fora do `open` a idade e do vinculo
+    // anterior — reportar isso como idade da conexao induz leitura errada.
+    const isOpen = state === 'open';
+    const stableOpen = isOpen && this.stayedUpLongEnoughToReset();
+
     return {
-      state: this.stateConnection?.state ?? null,
+      state,
       statusReason: this.stateConnection?.statusReason ?? null,
       badSessionCloses: {
-        consecutive: this.consecutiveBadSessionCloses,
+        consecutive: stableOpen ? 0 : this.consecutiveBadSessionCloses,
         total: this.badSessionClosesTotal,
-        inLoop: this.consecutiveBadSessionCloses >= BaileysStartupService.BAD_SESSION_MAX_RECONNECTS,
+        inLoop: stableOpen
+          ? false
+          : this.consecutiveBadSessionCloses >= BaileysStartupService.BAD_SESSION_MAX_RECONNECTS,
       },
-      reconnectAttempts: this.reconnectAttempts,
+      reconnectAttempts: stableOpen ? 0 : this.reconnectAttempts,
       isReconnecting: this.isReconnecting,
-      connectionAgeMs: this.lastConnectionOpenAt ? Date.now() - this.lastConnectionOpenAt : null,
-      observedForMs: Date.now() - this.observedSince,
+      connectionAgeMs: isOpen && this.lastConnectionOpenAt ? Date.now() - this.lastConnectionOpenAt : null,
+      observedForMs: this.observedSince ? Date.now() - this.observedSince : null,
     };
+  };
+
+  /**
+   * A conexao anterior ficou de pe o suficiente para os contadores de reconexao serem
+   * considerados zerados. Fonte unica da regra: `scheduleReconnect()` a usa para MUTAR
+   * os contadores no proximo close, e `getLiveSignals()` para projetar esse mesmo reset
+   * na leitura enquanto a sessao segue `open`.
+   */
+  private stayedUpLongEnoughToReset(): boolean {
+    return (
+      !!this.lastConnectionOpenAt &&
+      Date.now() - this.lastConnectionOpenAt > BaileysStartupService.RECONNECT_STABLE_RESET_MS
+    );
   }
 
   /**
@@ -1006,10 +1048,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     // Reset attempt counter if the previous connection stayed up long enough
-    if (
-      this.lastConnectionOpenAt &&
-      Date.now() - this.lastConnectionOpenAt > BaileysStartupService.RECONNECT_STABLE_RESET_MS
-    ) {
+    if (this.stayedUpLongEnoughToReset()) {
       this.reconnectAttempts = 0;
       this.consecutiveBadSessionCloses = 0;
     }
@@ -1404,6 +1443,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
+      // Primeira tentativa de conexao deste processo: e daqui que a janela de
+      // observacao dos contadores passa a valer (ver getLiveSignals).
+      this.observedSince ??= Date.now();
+
       this.loadChatwoot();
       // Awaited so localSettings (alwaysOnline → markOnlineOnConnect) is loaded
       // before makeWASocket reads it in createClient.
