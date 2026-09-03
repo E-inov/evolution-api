@@ -237,16 +237,22 @@ export class ProxyController {
         error: null,
       };
     } catch (error) {
-      // Se veio RESPOSTA HTTP, o proxy esta vivo e falando: o que falhou foi credencial ou
-      // allowlist de IP (tipicamente 407), nao a porta. Tratar isso como porta morta e o que
-      // permitiria a queda da allowlist do fornecedor quarentenar o pool INTEIRO de uma vez.
+      // Tres desfechos diferentes, e so um deles fala da porta:
+      //
+      //  - sem resposta HTTP -> nao conseguimos nem falar com o proxy: `proxy_unreachable`;
+      //  - 401/403/407 -> o proxy esta vivo e RECUSOU: credencial ou allowlist de IP. A porta
+      //    responde; tratar isso como porta morta e o que permitiria a queda da allowlist do
+      //    fornecedor quarentenar o pool INTEIRO de uma vez;
+      //  - outro status -> o tunel FORMOU e quem falhou foi o destino (o proprio endereco de
+      //    referencia). Isso e falha de referencia, nao da porta, e por isso reusa o mesmo
+      //    outcome da chamada direta que falha.
       const proxyHttpStatus = axios.isAxiosError(error) ? (error.response?.status ?? null) : null;
 
       logger.error('probeProxy: proxy nao serviu: ' + ProxyController.describeError(error));
 
       return {
         ...base,
-        outcome: proxyHttpStatus === null ? 'proxy_unreachable' : 'proxy_refused',
+        outcome: ProxyController.outcomeDaFalhaNoProxy(proxyHttpStatus),
         originIp,
         latencyMs: Date.now() - proxyStartedAt,
         referenceLatencyMs,
@@ -254,6 +260,21 @@ export class ProxyController {
         error: ProxyController.describeError(error),
       };
     }
+  }
+
+  /**
+   * Status com que o proxy RECUSA o pedido, em vez de repassa-lo. Nesses o tunel nao formou e
+   * quem falou foi o proxy; em qualquer outro status o tunel formou e quem falhou foi o
+   * destino, que e outra conversa.
+   */
+  private static readonly STATUS_DE_RECUSA = [401, 403, 407];
+
+  private static outcomeDaFalhaNoProxy(proxyHttpStatus: number | null): ProxyProbeOutcome {
+    if (proxyHttpStatus === null) {
+      return 'proxy_unreachable';
+    }
+
+    return ProxyController.STATUS_DE_RECUSA.includes(proxyHttpStatus) ? 'proxy_refused' : 'reference_unreachable';
   }
 
   /** O icanhazip devolve o IP com `\n`; comparar sem normalizar nunca casaria. */
