@@ -9,7 +9,50 @@ import axios from 'axios';
 
 const logger = new Logger('ProxyController');
 
+/**
+ * Resultado DISCRIMINADO da sonda de proxy (issue cnpjbiz#2457).
+ *
+ * `ok` sozinho nao serve para decidir quarentena: o `testProxy()` antigo devolvia
+ * `false` no `catch` de QUALQUER erro, inclusive o da chamada de referencia SEM proxy.
+ * Com isso "porta morta" e "icanhazip fora do ar" ficavam indistinguiveis — e uma
+ * varredura automatica que confiasse nesse booleano marcaria o POOL INTEIRO como morto
+ * durante uma queda do endpoint de referencia, deixando o `newProxy` do CRM sem nenhuma
+ * porta para entregar. Por isso o `outcome`.
+ */
+export type ProxyProbeOutcome =
+  /** A porta responde e o IP de saida e outro: proxy funcionando. */
+  | 'ok'
+  /** A porta responde mas o IP de saida e o do proprio droplet: proxy nao esta roteando. */
+  | 'same_origin_ip'
+  /** A chamada PELO proxy falhou: e o unico veredito que sustenta "porta morta". */
+  | 'proxy_unreachable'
+  /** A chamada DIRETA falhou: nao medimos nada sobre a porta. Nao conclua nada daqui. */
+  | 'reference_unreachable';
+
+export type ProxyProbeResult = {
+  ok: boolean;
+  outcome: ProxyProbeOutcome;
+  /** IP visto atraves do proxy, quando houve resposta. */
+  exitIp: string | null;
+  /** IP do proprio droplet, quando a chamada de referencia respondeu. */
+  originIp: string | null;
+  /** Latencia da chamada PELO proxy, em ms. `null` quando ela nao chegou a acontecer. */
+  latencyMs: number | null;
+  /** Latencia da chamada de referencia, em ms. Serve para separar "rede do host ruim". */
+  referenceLatencyMs: number | null;
+  error: string | null;
+};
+
 export class ProxyController {
+  /**
+   * Sem timeout, o axios espera indefinidamente e a sonda deixa de ser sonda: em host
+   * sob carga (onda de 500, memoria apertada) a chamada travada devolvia `false` tarde
+   * demais e o `createProxy` recusava proxy BOM com "Invalid proxy".
+   */
+  private static readonly PROBE_TIMEOUT_MS = 15000;
+
+  private static readonly REFERENCE_URL = 'https://icanhazip.com/';
+
   constructor(
     private readonly proxyService: ProxyService,
     private readonly waMonitor: WAMonitoringService,
@@ -29,9 +72,18 @@ export class ProxyController {
     }
 
     if (data.host) {
-      const testProxy = await this.testProxy(data);
-      if (!testProxy) {
+      const probe = await this.probeProxy(data);
+
+      // So recusa quando a sonda PROVA que o proxy esta ruim. `reference_unreachable`
+      // significa que a chamada direta (sem proxy) falhou — nao ha medida nenhuma sobre
+      // a porta, e reprovar ali era o falso positivo conhecido: uma lentidao do
+      // icanhazip.com bloqueava provisionamento de conta com porta perfeita.
+      if (probe.outcome === 'proxy_unreachable' || probe.outcome === 'same_origin_ip') {
         throw new BadRequestException('Invalid proxy');
+      }
+
+      if (!probe.ok) {
+        logger.warn(`createProxy: seguindo sem veredito da sonda (${probe.outcome}): ${probe.error}`);
       }
     }
 
@@ -46,29 +98,112 @@ export class ProxyController {
     return this.proxyService.find(instance);
   }
 
-  public async testProxy(proxy: ProxyDto) {
+  /**
+   * Sonda uma porta de proxy A PARTIR DESTE HOST, sem tocar em instancia nenhuma.
+   *
+   * Existe porque quem decide trocar a porta de um cliente e o `schedule:run` do Laravel,
+   * que roda no LB — e o LB **nao esta na allowlist por IP** do fornecedor de proxy, que
+   * so libera os 4 droplets da Evolution. Sondar de la mediria a rota errada e daria
+   * "morta" para porta viva. Alem disso a porta pode responder de um droplet e nao de
+   * outro, entao a sonda tem de sair do host onde a instancia roda.
+   */
+  public async testProxyEndpoint(data: ProxyDto): Promise<ProxyProbeResult> {
+    return this.probeProxy(data);
+  }
+
+  /**
+   * Compatibilidade: o veredito booleano de sempre. Mantido porque a semantica "true =
+   * pode usar" e o que os chamadores antigos esperam. Codigo novo deve usar
+   * {@link probeProxy} e olhar o `outcome`.
+   */
+  public async testProxy(proxy: ProxyDto): Promise<boolean> {
+    return (await this.probeProxy(proxy)).ok;
+  }
+
+  /**
+   * ORDEM IMPORTA: a chamada de referencia vem primeiro e, se ela falhar, a sonda para
+   * ali com `reference_unreachable`. Sem essa separacao nao ha como distinguir "a porta
+   * morreu" de "o endereco de referencia esta fora", que e a diferenca entre quarentenar
+   * uma porta e quarentenar o pool inteiro.
+   */
+  private async probeProxy(proxy: ProxyDto): Promise<ProxyProbeResult> {
+    const base: ProxyProbeResult = {
+      ok: false,
+      outcome: 'reference_unreachable',
+      exitIp: null,
+      originIp: null,
+      latencyMs: null,
+      referenceLatencyMs: null,
+      error: null,
+    };
+
+    const referenceStartedAt = Date.now();
+    let originIp: string;
+
     try {
-      const serverIp = await axios.get('https://icanhazip.com/');
-      const response = await axios.get('https://icanhazip.com/', {
-        httpsAgent: makeProxyAgent(proxy),
+      const serverIp = await axios.get(ProxyController.REFERENCE_URL, {
+        timeout: ProxyController.PROBE_TIMEOUT_MS,
       });
 
-      const result = response?.data !== serverIp?.data;
-      if (result) {
-        logger.info('testProxy: proxy connection successful');
-      } else {
-        logger.warn("testProxy: proxy connection doesn't change the origin IP");
-      }
-
-      return result;
+      originIp = ProxyController.normalizeIp(serverIp?.data);
     } catch (error) {
-      if (axios.isAxiosError(error)) {
-        logger.error('testProxy error: axios error: ' + error.message);
-      } else {
-        logger.error('testProxy error: unexpected error: ' + error);
+      logger.error('probeProxy: referencia inalcancavel: ' + ProxyController.describeError(error));
+
+      return {
+        ...base,
+        referenceLatencyMs: Date.now() - referenceStartedAt,
+        error: ProxyController.describeError(error),
+      };
+    }
+
+    const referenceLatencyMs = Date.now() - referenceStartedAt;
+    const proxyStartedAt = Date.now();
+
+    try {
+      const response = await axios.get(ProxyController.REFERENCE_URL, {
+        httpsAgent: makeProxyAgent(proxy),
+        timeout: ProxyController.PROBE_TIMEOUT_MS,
+      });
+
+      const exitIp = ProxyController.normalizeIp(response?.data);
+      const latencyMs = Date.now() - proxyStartedAt;
+
+      // Porta que RESPONDE devolvendo o IP do proprio droplet nao esta morta — esta
+      // sem rotear. Sao problemas diferentes, com condutas diferentes, e misturar os
+      // dois no mesmo `false` estragaria a calibragem do N sondas da quarentena.
+      if (exitIp === originIp) {
+        logger.warn("probeProxy: proxy connection doesn't change the origin IP");
+
+        return { ...base, outcome: 'same_origin_ip', exitIp, originIp, latencyMs, referenceLatencyMs };
       }
 
-      return false;
+      logger.info('probeProxy: proxy connection successful');
+
+      return { ok: true, outcome: 'ok', exitIp, originIp, latencyMs, referenceLatencyMs, error: null };
+    } catch (error) {
+      logger.error('probeProxy: proxy inalcancavel: ' + ProxyController.describeError(error));
+
+      return {
+        ...base,
+        outcome: 'proxy_unreachable',
+        originIp,
+        latencyMs: Date.now() - proxyStartedAt,
+        referenceLatencyMs,
+        error: ProxyController.describeError(error),
+      };
     }
+  }
+
+  /** O icanhazip devolve o IP com `\n`; comparar sem normalizar nunca casaria. */
+  private static normalizeIp(data: unknown): string {
+    return typeof data === 'string' ? data.trim() : String(data ?? '').trim();
+  }
+
+  private static describeError(error: unknown): string {
+    if (axios.isAxiosError(error)) {
+      return `${error.code ?? 'axios'}: ${error.message}`;
+    }
+
+    return String(error);
   }
 }

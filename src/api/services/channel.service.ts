@@ -410,6 +410,15 @@ export class ChannelStartupService {
   }
 
   public async setProxy(data: ProxyDto) {
+    // `username`/`password` sao NOT NULL no schema (`model Proxy`), e o `upsert` valida o
+    // ramo `create` mesmo quando o registro ja existe — mandar `undefined` fazia o Prisma
+    // recusar a gravacao inteira com `Argument 'username' is missing` (issue cnpjbiz#2457).
+    // O fornecedor de proxy da frota autentica por IP, entao string vazia e o valor certo
+    // e nao um placeholder: forcar o chamador a mandar dois campos vazios era transformar
+    // um detalhe de schema em contrato de API.
+    const username = data.username ?? '';
+    const password = data.password ?? '';
+
     await this.prismaRepository.proxy.upsert({
       where: {
         instanceId: this.instanceId,
@@ -419,16 +428,16 @@ export class ChannelStartupService {
         host: data.host,
         port: data.port,
         protocol: data.protocol,
-        username: data.username,
-        password: data.password,
+        username,
+        password,
       },
       create: {
         enabled: data?.enabled,
         host: data.host,
         port: data.port,
         protocol: data.protocol,
-        username: data.username,
-        password: data.password,
+        username,
+        password,
         instanceId: this.instanceId,
       },
     });

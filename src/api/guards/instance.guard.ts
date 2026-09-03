@@ -27,6 +27,14 @@ export async function instanceExistsGuard(req: Request, _: Response, next: NextF
     return next();
   }
 
+  // `POST /proxy/test` sonda uma porta a partir DESTE host e nao pertence a instancia
+  // nenhuma — inclusive sonda portas livres do pool (issue cnpjbiz#2457). Mesma isencao
+  // do `fetchInstances`, que tambem e operacao de host. Casamento pelo FIM do caminho,
+  // sem a query string, para que `?x=/proxy/test` em outra rota nao pule o guard.
+  if (req.originalUrl.split('?')[0].endsWith('/proxy/test')) {
+    return next();
+  }
+
   const param = req.params as unknown as InstanceDto;
   if (!param?.instanceName) {
     throw new BadRequestException('"instanceName" not provided.');
