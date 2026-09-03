@@ -108,15 +108,22 @@ export class InstanceController {
       };
 
       if (instanceData.proxyHost && instanceData.proxyPort && instanceData.proxyProtocol) {
-        const testProxy = await this.proxyService.testProxy({
+        // Veredito DISCRIMINADO, nao o booleano (issue cnpjbiz#2457). O `testProxy()` era
+        // `false` tambem quando a chamada de REFERENCIA falhava — e ai o icanhazip fora do ar
+        // derrubava a criacao de conta com porta perfeita. So recusa quando a sonda prova que
+        // o proxy nao serve; sem medida, segue e deixa a varredura de portas achar depois.
+        const probe = await this.proxyService.testProxyEndpoint({
           host: instanceData.proxyHost,
           port: instanceData.proxyPort,
           protocol: instanceData.proxyProtocol,
           username: instanceData.proxyUsername,
           password: instanceData.proxyPassword,
         });
-        if (!testProxy) {
+        if (ProxyController.PROVA_PROXY_RUIM.includes(probe.outcome)) {
           throw new BadRequestException('Invalid proxy');
+        }
+        if (!probe.ok) {
+          this.logger.warn(`createInstance: proxy sem veredito da sonda (${probe.outcome}): ${probe.error}`);
         }
         await this.proxyService.createProxy(instanceDto, {
           enabled: true,

@@ -22,8 +22,36 @@ async function getInstance(instanceName: string) {
   }
 }
 
+/**
+ * O pedido e a sonda de porta (`POST /proxy/test`), em qualquer grafia que o Express aceite?
+ *
+ * Barras repetidas viram uma so, barra final e ignorada e a comparacao e minuscula — as tres
+ * variacoes alcancam a rota, entao as tres precisam da mesma isencao.
+ */
+function isProxyTestPath(req: Request): boolean {
+  const caminho = `${req.baseUrl}${req.path}`
+    .toLowerCase()
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/+$/, '');
+
+  return caminho === '/proxy/test';
+}
+
 export async function instanceExistsGuard(req: Request, _: Response, next: NextFunction) {
   if (req.originalUrl.includes('/instance/create') || req.originalUrl.includes('/instance/fetchInstances')) {
+    return next();
+  }
+
+  // `POST /proxy/test` sonda uma porta a partir DESTE host e nao pertence a instancia
+  // nenhuma — inclusive sonda portas livres do pool (issue cnpjbiz#2457). Mesma isencao
+  // do `fetchInstances`, que tambem e operacao de host.
+  //
+  // Casamento pelo caminho NORMALIZADO do router, nao por `endsWith` no `originalUrl`: o
+  // Express e non-strict e case-insensitive, entao `/proxy/test/`, `/proxy/TEST` e
+  // `/proxy//test` alcancam a MESMA rota — e com o `endsWith` elas passavam pelo guard e
+  // morriam em 400 `"instanceName" not provided.`, um 400 que ninguem consegue explicar.
+  // `req.baseUrl` + `req.path` tambem ignoram a query string por construcao.
+  if (isProxyTestPath(req)) {
     return next();
   }
 

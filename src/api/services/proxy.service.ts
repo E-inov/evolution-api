@@ -10,8 +10,16 @@ export class ProxyService {
 
   private readonly logger = new Logger('ProxyService');
 
-  public create(instance: InstanceDto, data: ProxyDto) {
-    this.waMonitor.waInstances[instance.instanceName].setProxy(data);
+  /**
+   * `await` NAO e detalhe (issue cnpjbiz#2457): sem ele a rejeicao do Prisma virava
+   * unhandled rejection e o `POST /proxy/set` respondia **201 com a porta nova no corpo
+   * sem ter gravado nada**. O unico rastro era `Argument 'username' is missing` no
+   * evolution-api-error.log. Quem trocava porta lendo a resposta reiniciava a instancia
+   * confiante e a devolvia na porta VELHA — pior que nao ter trocado, porque derruba a
+   * sessao a toa.
+   */
+  public async create(instance: InstanceDto, data: ProxyDto) {
+    await this.waMonitor.waInstances[instance.instanceName].setProxy(data);
 
     return { proxy: { ...instance, proxy: data } };
   }

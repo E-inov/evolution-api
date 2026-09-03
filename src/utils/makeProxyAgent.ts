@@ -11,6 +11,19 @@ type Proxy = {
   username?: string;
 };
 
+/**
+ * Protocolos que o `selectProxyAgent` sabe construir — FONTE UNICA (issue cnpjbiz#2457).
+ *
+ * Exportado para o schema de validacao derivar dele em vez de repetir a lista. Duas listas
+ * divergindo aqui e auto-infligir falha em massa: um enum mais estreito que o suportado
+ * transforma sonda que funciona em erro de config na frota inteira, e um mais largo devolve
+ * o erro tarde, ja dentro da sonda.
+ *
+ * Nao inclui `https` nem `socks4`: quem os aceita e o `makeProxyAgentUndici`, que e outra
+ * funcao e tem outro switch.
+ */
+export const SUPPORTED_PROXY_PROTOCOLS = ['http', 'socks', 'socks5'] as const;
+
 function selectProxyAgent(proxyUrl: string): HttpsProxyAgent<string> | SocksProxyAgent {
   const url = new URL(proxyUrl);
 
