@@ -684,7 +684,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
       // This prevents infinite loop that blocks QR code generation
-      const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
+      //
+      // O predicado pergunta "esta instância já pareou alguma vez?", e `wuid` não responde
+      // isso: ele só é preenchido no `open` (adiante, no ramo `connection === 'open'`), então
+      // depois de um restart do processo TODA instância que ainda não reconectou tem `wuid`
+      // vazio — mesmo com credenciais salvas e milhares de mensagens no histórico. O guard
+      // confundia "reconexão pendente" com "aguardando QR inicial" e engolia o close: sem
+      // publicar evento, sem agendar reconnect e sem gerar QR, o processo ficava `close`, o
+      // banco `open` e o CRM em 'connecting' para sempre (cnpjbiz#2472). A resposta durável
+      // está no auth state: `creds.me` é a identidade pareada, carregada do storage em
+      // `defineAuthState()` antes de o socket existir. Instância genuinamente nova não tem
+      // `creds.me`, continua caindo no guard, e o fluxo de QR fica idêntico.
+      const hasPairedBefore = Boolean(this.instance.authState?.state?.creds?.me?.id || this.instance.wuid);
+      const isInitialConnection = !hasPairedBefore && (this.instance.qrcode?.count ?? 0) === 0;
 
       // Código terminal (401 loggedOut, 403 forbidden...) NÃO pode ser engolido pelo guard
       // de conexão inicial: é a sessão salva que morreu (aparelho desvinculado offline), não
@@ -694,7 +706,23 @@ export class BaileysStartupService extends ChannelStartupService {
       // publica STATUS_INSTANCE/CONNECTION_UPDATE, marca close no banco e o logout.instance
       // limpa as credenciais mortas — o próximo connect vai direto para a geração de QR.
       if (isInitialConnection && !codesToNotReconnect.includes(statusCode)) {
-        this.logger.info('Initial connection closed, waiting for QR code generation...');
+        // Instância com credenciais salvas não chega aqui. Se ainda assim há `ownerJid`, ela
+        // pareou algum dia e perdeu as credenciais: esperar o QR é o certo, mas alguém precisa
+        // lê-lo — então isto é alarme, não rotina. Sem `ownerJid` é o caso legítimo de
+        // instância nova aguardando o primeiro pareamento.
+        const waitingForQrCode = {
+          message: 'Initial connection closed, waiting for QR code generation...',
+          statusCode,
+          instanceName: this.instance.name,
+          ownerJid: this.instance.ownerJid ?? null,
+        };
+
+        if (this.instance.ownerJid) {
+          this.logger.warn(waitingForQrCode);
+        } else {
+          this.logger.info(waitingForQrCode);
+        }
+
         return;
       }
 
