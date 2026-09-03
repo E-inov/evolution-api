@@ -24,8 +24,25 @@ export type ProxyProbeOutcome =
   | 'ok'
   /** A porta responde mas o IP de saida e o do proprio droplet: proxy nao esta roteando. */
   | 'same_origin_ip'
-  /** A chamada PELO proxy falhou: e o unico veredito que sustenta "porta morta". */
+  /**
+   * Nao conseguimos NEM FALAR com o proxy: e o unico veredito que sustenta "porta morta".
+   *
+   * Estreito de proposito. Antes este outcome absorvia tambem config invalida e proxy que
+   * RESPONDEU recusando — e ai bastava o droplet sair da allowlist do fornecedor para toda
+   * porta voltar `proxy_unreachable` e a varredura quarentenar o pool inteiro. Era o mesmo
+   * desastre que o `reference_unreachable` existe para evitar, entrando por outra porta.
+   */
   | 'proxy_unreachable'
+  /**
+   * O proxy RESPONDEU com erro HTTP (tipicamente 407, autenticacao/allowlist). A porta esta
+   * viva; o que falhou foi a credencial ou o IP de origem. Nao e veredito sobre a porta.
+   */
+  | 'proxy_refused'
+  /**
+   * Nem chegamos a tentar: protocolo/porta invalidos no proprio pedido. Defeito de
+   * configuracao nossa, nunca da porta.
+   */
+  | 'invalid_config'
   /** A chamada DIRETA falhou: nao medimos nada sobre a porta. Nao conclua nada daqui. */
   | 'reference_unreachable';
 
@@ -40,6 +57,8 @@ export type ProxyProbeResult = {
   latencyMs: number | null;
   /** Latencia da chamada de referencia, em ms. Serve para separar "rede do host ruim". */
   referenceLatencyMs: number | null;
+  /** Status HTTP com que o PROXY respondeu, quando ele respondeu. 407 = allowlist/credencial. */
+  proxyHttpStatus: number | null;
   error: string | null;
 };
 
@@ -52,6 +71,18 @@ export class ProxyController {
   private static readonly PROBE_TIMEOUT_MS = 15000;
 
   private static readonly REFERENCE_URL = 'https://icanhazip.com/';
+
+  /**
+   * Outcomes que PROVAM que este proxy nao serve para a instancia. Recusar por qualquer outra
+   * coisa era o falso positivo conhecido: uma lentidao do endereco de referencia bloqueava
+   * provisionamento de conta com porta perfeita.
+   */
+  public static readonly PROVA_PROXY_RUIM: ProxyProbeOutcome[] = [
+    'proxy_unreachable',
+    'same_origin_ip',
+    'invalid_config',
+    'proxy_refused',
+  ];
 
   constructor(
     private readonly proxyService: ProxyService,
@@ -78,7 +109,7 @@ export class ProxyController {
       // significa que a chamada direta (sem proxy) falhou — nao ha medida nenhuma sobre
       // a porta, e reprovar ali era o falso positivo conhecido: uma lentidao do
       // icanhazip.com bloqueava provisionamento de conta com porta perfeita.
-      if (probe.outcome === 'proxy_unreachable' || probe.outcome === 'same_origin_ip') {
+      if (ProxyController.PROVA_PROXY_RUIM.includes(probe.outcome)) {
         throw new BadRequestException('Invalid proxy');
       }
 
@@ -134,8 +165,24 @@ export class ProxyController {
       originIp: null,
       latencyMs: null,
       referenceLatencyMs: null,
+      proxyHttpStatus: null,
       error: null,
     };
+
+    // O agent e construido ANTES de qualquer chamada, e fora do try do proxy, porque
+    // `makeProxyAgent` LANCA para protocolo nao suportado e para porta que nao forma URL
+    // valida. Dentro do try, esses erros viravam `proxy_unreachable` — ou seja, um typo
+    // nosso no pedido virava veredito de "porta morta" e, com N deles, quarentena de porta
+    // boa. Aqui a config invalida falha em outcome proprio e sem gastar chamada nenhuma.
+    let agent: ReturnType<typeof makeProxyAgent>;
+
+    try {
+      agent = makeProxyAgent(proxy);
+    } catch (error) {
+      logger.error('probeProxy: configuracao invalida: ' + ProxyController.describeError(error));
+
+      return { ...base, outcome: 'invalid_config', error: ProxyController.describeError(error) };
+    }
 
     const referenceStartedAt = Date.now();
     let originIp: string;
@@ -161,7 +208,7 @@ export class ProxyController {
 
     try {
       const response = await axios.get(ProxyController.REFERENCE_URL, {
-        httpsAgent: makeProxyAgent(proxy),
+        httpsAgent: agent,
         timeout: ProxyController.PROBE_TIMEOUT_MS,
       });
 
@@ -179,16 +226,31 @@ export class ProxyController {
 
       logger.info('probeProxy: proxy connection successful');
 
-      return { ok: true, outcome: 'ok', exitIp, originIp, latencyMs, referenceLatencyMs, error: null };
+      return {
+        ok: true,
+        outcome: 'ok',
+        exitIp,
+        originIp,
+        latencyMs,
+        referenceLatencyMs,
+        proxyHttpStatus: null,
+        error: null,
+      };
     } catch (error) {
-      logger.error('probeProxy: proxy inalcancavel: ' + ProxyController.describeError(error));
+      // Se veio RESPOSTA HTTP, o proxy esta vivo e falando: o que falhou foi credencial ou
+      // allowlist de IP (tipicamente 407), nao a porta. Tratar isso como porta morta e o que
+      // permitiria a queda da allowlist do fornecedor quarentenar o pool INTEIRO de uma vez.
+      const proxyHttpStatus = axios.isAxiosError(error) ? (error.response?.status ?? null) : null;
+
+      logger.error('probeProxy: proxy nao serviu: ' + ProxyController.describeError(error));
 
       return {
         ...base,
-        outcome: 'proxy_unreachable',
+        outcome: proxyHttpStatus === null ? 'proxy_unreachable' : 'proxy_refused',
         originIp,
         latencyMs: Date.now() - proxyStartedAt,
         referenceLatencyMs,
+        proxyHttpStatus,
         error: ProxyController.describeError(error),
       };
     }
@@ -201,7 +263,11 @@ export class ProxyController {
 
   private static describeError(error: unknown): string {
     if (axios.isAxiosError(error)) {
-      return `${error.code ?? 'axios'}: ${error.message}`;
+      // O status entra na mensagem: sem ele, `Request failed with status code 407` e
+      // `ECONNREFUSED` ficavam indistinguiveis em quem so lesse o texto do erro.
+      const status = error.response?.status;
+
+      return `${error.code ?? 'axios'}${status ? ` (HTTP ${status})` : ''}: ${error.message}`;
     }
 
     return String(error);
