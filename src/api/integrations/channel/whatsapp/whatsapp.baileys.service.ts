@@ -1412,6 +1412,44 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
+    // ------------------------------------------------------------------
+    // Ack da stanza <status> — o Baileys não acka essa tag, e o servidor
+    // derruba o stream 50 min depois de cobrar o ack que nunca chegou.
+    //
+    // Quadro medido (cnpjbiz#2473, 03/09/2026): mídia de canal e de status de
+    // contato chega como <status from='...@newsletter|status@broadcast'
+    // type='media' id='X'>. O `messages-recv` do Baileys registra CB:message,
+    // CB:call, CB:receipt, CB:notification e CB:ack,class:message — não existe
+    // CB:status, e a tag nem aparece no arquivo, então `sendMessageAck` nunca é
+    // chamado para ela. O servidor reentrega (offline=1..6) e, exatamente 50,0
+    // min após a última entrega (mediana 49,99 min, p25 49,99 / p75 50,00,
+    // n=147), fecha o stream devolvendo o stanza cobrado:
+    //
+    //   recv xml  <stream:error > <ack class='status' type='media' id='X'/> </stream:error>
+    //
+    // Como o nó vem sem `code`, `getErrorCodeFromStreamError` cai no default
+    // `badSession` (500) — é a origem da fila de closes 500 a cada 50 min. O
+    // mesmo relógio aparece cobrando ack de `message`, `notification` e
+    // `receipt`, o que confirma que o timer é do mecanismo, não do status.
+    // Escala na frota: 62 instâncias, 12 contas com hash atual, todas `open`.
+    //
+    // `sendMessageAck` é exportado pelo socket e monta `class: tag` +
+    // `type: attrs.type`, ou seja produz exatamente o ack cobrado. É ack de
+    // ENTREGA, não de leitura: não marca o status como visto — isso é
+    // `readMessages`, atrás do setting `readStatus`, que segue inalterado.
+    this.client.ws.on('CB:status', async (node: any) => {
+      try {
+        await this.client.sendMessageAck(node);
+      } catch (error) {
+        this.logger.warn({
+          message: 'ack de stanza <status> falhou',
+          instanceName: this.instance.name,
+          stanzaId: node?.attrs?.id ?? null,
+          err: error?.message?.slice(0, 160) ?? String(error).slice(0, 160),
+        });
+      }
+    });
+
     // Captura acks de ERRO de envio: quando o WhatsApp rejeita uma mensagem
     // enviada, responde com <ack ... error="<code>" />. Logamos apenas esses
     // (acks de sucesso não têm o atributo `error`), para expor o motivo real
