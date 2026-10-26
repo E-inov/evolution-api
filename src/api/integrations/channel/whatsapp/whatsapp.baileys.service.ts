@@ -266,6 +266,11 @@ export class BaileysStartupService extends ChannelStartupService {
   private reconnectAttempts = 0;
   private consecutiveBadSessionCloses = 0;
   private lastConnectionOpenAt?: number;
+  // The 'open' of the current connection, consumed by the next scheduleReconnect().
+  // Unlike `lastConnectionOpenAt` (written on 'open', never cleared), it stays empty
+  // while an attempt never reaches 'open' — which is what keeps a run of attempts
+  // that never open from resetting the backoff. See stayedUpLongEnoughToReset().
+  private currentConnectionOpenAt?: number;
   // Every badSession (500) close since this instance was loaded, never reset.
   // `consecutiveBadSessionCloses` answers "is it losing the fight right now?"
   // and is zeroed by 30s of stability; this one keeps the history, so a caller
@@ -407,15 +412,21 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   /**
-   * A conexao anterior ficou de pe o suficiente para os contadores de reconexao serem
+   * A conexao corrente ficou de pe o suficiente para os contadores de reconexao serem
    * considerados zerados. Fonte unica da regra: `scheduleReconnect()` a usa para MUTAR
    * os contadores no proximo close, e `getLiveSignals()` para projetar esse mesmo reset
    * na leitura enquanto a sessao segue `open`.
+   *
+   * Mede o `open` da conexao CORRENTE, nao o ultimo `open` da instancia. Medindo pelo
+   * `lastConnectionOpenAt`, que nunca e limpo, uma instancia que abriu horas atras e
+   * depois so falha zerava os contadores em TODA tentativa: o backoff nunca passava do
+   * "attempt 1" e o piso de loop 500 nunca era atingido. Medido em 26/10/2026 no wa-2:
+   * ~1.200 tentativas/h numa conta so, cada uma subindo um socket e um logger novos.
    */
   private stayedUpLongEnoughToReset(): boolean {
     return (
-      !!this.lastConnectionOpenAt &&
-      Date.now() - this.lastConnectionOpenAt > BaileysStartupService.RECONNECT_STABLE_RESET_MS
+      !!this.currentConnectionOpenAt &&
+      Date.now() - this.currentConnectionOpenAt > BaileysStartupService.RECONNECT_STABLE_RESET_MS
     );
   }
 
@@ -799,6 +810,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // dies again. Both counters are reset only after the connection stays
       // stable for RECONNECT_STABLE_RESET_MS — see scheduleReconnect().
       this.lastConnectionOpenAt = Date.now();
+      this.currentConnectionOpenAt = this.lastConnectionOpenAt;
 
       // Connection is up: the slot did its job, hand it to the next in line.
       this.freeReconnectSlot();
@@ -1078,11 +1090,14 @@ export class BaileysStartupService extends ChannelStartupService {
       return;
     }
 
-    // Reset attempt counter if the previous connection stayed up long enough
+    // Reset attempt counter if the connection that just ended stayed up long enough.
+    // Its 'open' is consumed here: the next attempt only resets the counters if it
+    // reaches 'open' itself and stays there.
     if (this.stayedUpLongEnoughToReset()) {
       this.reconnectAttempts = 0;
       this.consecutiveBadSessionCloses = 0;
     }
+    this.currentConnectionOpenAt = undefined;
 
     const backoffTarget = Math.min(
       BaileysStartupService.RECONNECT_BACKOFF_BASE_MS * 2 ** this.reconnectAttempts,
