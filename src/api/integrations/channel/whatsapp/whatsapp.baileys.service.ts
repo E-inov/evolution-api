@@ -258,6 +258,7 @@ export class BaileysStartupService extends ChannelStartupService {
   // One Baileys logger per instance, reused across reconnects — see getBaileysLogger().
   private baileysLogDestination?: ReturnType<typeof P.destination>;
   private baileysLogger?: P.Logger;
+  private baileysLogErrorReported = false;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
   // Reconnection control — prevents parallel reconnect timers from piling up
@@ -291,6 +292,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly RECONNECT_BACKOFF_BASE_MS = 3000;
   private static readonly RECONNECT_BACKOFF_CAP_MS = 60000;
   private static readonly RECONNECT_STABLE_RESET_MS = 30000;
+  // Cap on the Baileys log lines held in RAM while the file cannot be written
+  // (sonic-boom maxLength, in characters) — see getBaileysLogger().
+  private static readonly BAILEYS_LOG_MAX_BUFFER = 8 * 1024 * 1024;
   // After this many consecutive badSession (500) closes, throttle reconnects to
   // the backoff cap so a tight open→close loop stops hammering the server.
   // Non-destructive: it keeps retrying slowly (never wipes credentials), so the
@@ -420,8 +424,8 @@ export class BaileysStartupService extends ChannelStartupService {
    * Mede o `open` da conexao CORRENTE, nao o ultimo `open` da instancia. Medindo pelo
    * `lastConnectionOpenAt`, que nunca e limpo, uma instancia que abriu horas atras e
    * depois so falha zerava os contadores em TODA tentativa: o backoff nunca passava do
-   * "attempt 1" e o piso de loop 500 nunca era atingido. Medido em 26/10/2026 no wa-2:
-   * ~1.200 tentativas/h numa conta so, cada uma subindo um socket e um logger novos.
+   * "attempt 1" e o piso de loop 500 nunca era atingido. Medido em 26/10/2026 num servidor
+   * da frota: ~1.200 tentativas/h numa conta so, cada uma subindo um socket e um logger novos.
    */
   private stayedUpLongEnoughToReset(): boolean {
     return (
@@ -1208,8 +1212,9 @@ export class BaileysStartupService extends ChannelStartupService {
    * do pino sobe uma worker thread (isolate V8 proprio + SharedArrayBuffer de 4 MB, ~10 MB
    * no total) que so morre quando o GC recolhe o logger antigo, e abre o arquivo DENTRO
    * dela — esse fd nunca era fechado, nem quando a worker morria. Medido em 26/10/2026: 153
-   * workers e 3,5 GB de RSS no wa-2 depois de um loop de reconexao numa conta so (127 delas
-   * nascidas em 10 minutos), e 22 a 31 mil fds abertos por processo nos 4 hosts.
+   * workers e 3,5 GB de RSS num servidor da frota depois de um loop de reconexao numa conta
+   * so (127 delas nascidas em 10 minutos), e 22 a 31 mil fds abertos por processo em todos
+   * os servidores.
    * `pino.destination` e o mesmo sonic-boom que o `pino/file` rodava dentro da worker: mesmo
    * arquivo, mesmo formato, sem a thread.
    *
@@ -1218,6 +1223,8 @@ export class BaileysStartupService extends ChannelStartupService {
    * quando cada tentativa abria o seu.
    */
   private getBaileysLogger(): P.Logger {
+    this.baileysLogErrorReported = false;
+
     if (this.baileysLogDestination) {
       try {
         this.baileysLogDestination.reopen();
@@ -1234,11 +1241,26 @@ export class BaileysStartupService extends ChannelStartupService {
       dest: `./logs/${this.instance.name}/baileys-logs.log`,
       mkdir: true,
       sync: false,
+      // Quando a escrita falha (disco cheio), o sonic-boom guarda na RAM o que nao gravou e
+      // tenta de novo a cada linha. Sem teto isso cresce ate o OOM e leva todas as instancias
+      // do servidor junto. Com o teto, ao encher ele descarta as linhas novas (evento 'drop')
+      // e PARA de tentar: so volta a gravar no proximo `reopen`, ou seja, na proxima
+      // reconexao. Uma instancia estavel fica sem log ate reconectar, mesmo com o disco ja
+      // liberado — aceitavel para log de diagnostico.
+      maxLength: BaileysStartupService.BAILEYS_LOG_MAX_BUFFER,
     });
     // Sem listener, o pino reemite como 'error' sem dono qualquer falha que nao seja EPIPE
-    // (disco cheio, permissao) e isso vira uncaughtException.
+    // (disco cheio, permissao) e isso vira uncaughtException. Registra so o primeiro erro de
+    // cada abertura: com o disco cheio toda linha falharia de novo, e o primeiro chega
+    // duplicado (o filterBrokenPipe do pino se remove e o reemite dentro do mesmo emit).
     destination.on('error', (error) => {
-      this.logger.error({ message: 'Baileys log file error', instanceName: this.instance.name, error: error?.message });
+      if (this.baileysLogErrorReported) return;
+      this.baileysLogErrorReported = true;
+      this.logger.error({
+        message: 'Baileys log file error — lines kept in RAM up to the cap, then dropped until the next reconnect',
+        instanceName: this.instance.name,
+        error: error?.message,
+      });
     });
     this.baileysLogDestination = destination;
 
