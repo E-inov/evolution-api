@@ -255,6 +255,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+  // One Baileys logger per instance, reused across reconnects — see getBaileysLogger().
+  private baileysLogDestination?: ReturnType<typeof P.destination>;
+  private baileysLogger?: P.Logger;
+  private baileysLogErrorReported = false;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
   // Reconnection control — prevents parallel reconnect timers from piling up
@@ -263,6 +267,11 @@ export class BaileysStartupService extends ChannelStartupService {
   private reconnectAttempts = 0;
   private consecutiveBadSessionCloses = 0;
   private lastConnectionOpenAt?: number;
+  // The 'open' of the current connection, consumed by the next scheduleReconnect().
+  // Unlike `lastConnectionOpenAt` (written on 'open', never cleared), it stays empty
+  // while an attempt never reaches 'open' — which is what keeps a run of attempts
+  // that never open from resetting the backoff. See stayedUpLongEnoughToReset().
+  private currentConnectionOpenAt?: number;
   // Every badSession (500) close since this instance was loaded, never reset.
   // `consecutiveBadSessionCloses` answers "is it losing the fight right now?"
   // and is zeroed by 30s of stability; this one keeps the history, so a caller
@@ -283,6 +292,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly RECONNECT_BACKOFF_BASE_MS = 3000;
   private static readonly RECONNECT_BACKOFF_CAP_MS = 60000;
   private static readonly RECONNECT_STABLE_RESET_MS = 30000;
+  // Cap on the Baileys log lines held in RAM while the file cannot be written
+  // (sonic-boom maxLength, in characters) — see getBaileysLogger().
+  private static readonly BAILEYS_LOG_MAX_BUFFER = 8 * 1024 * 1024;
   // After this many consecutive badSession (500) closes, throttle reconnects to
   // the backoff cap so a tight open→close loop stops hammering the server.
   // Non-destructive: it keeps retrying slowly (never wipes credentials), so the
@@ -404,15 +416,21 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   /**
-   * A conexao anterior ficou de pe o suficiente para os contadores de reconexao serem
+   * A conexao corrente ficou de pe o suficiente para os contadores de reconexao serem
    * considerados zerados. Fonte unica da regra: `scheduleReconnect()` a usa para MUTAR
    * os contadores no proximo close, e `getLiveSignals()` para projetar esse mesmo reset
    * na leitura enquanto a sessao segue `open`.
+   *
+   * Mede o `open` da conexao CORRENTE, nao o ultimo `open` da instancia. Medindo pelo
+   * `lastConnectionOpenAt`, que nunca e limpo, uma instancia que abriu horas atras e
+   * depois so falha zerava os contadores em TODA tentativa: o backoff nunca passava do
+   * "attempt 1" e o piso de loop 500 nunca era atingido. Medido em 26/10/2026 num servidor
+   * da frota: ~1.200 tentativas/h numa conta so, cada uma subindo um socket e um logger novos.
    */
   private stayedUpLongEnoughToReset(): boolean {
     return (
-      !!this.lastConnectionOpenAt &&
-      Date.now() - this.lastConnectionOpenAt > BaileysStartupService.RECONNECT_STABLE_RESET_MS
+      !!this.currentConnectionOpenAt &&
+      Date.now() - this.currentConnectionOpenAt > BaileysStartupService.RECONNECT_STABLE_RESET_MS
     );
   }
 
@@ -796,6 +814,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // dies again. Both counters are reset only after the connection stays
       // stable for RECONNECT_STABLE_RESET_MS — see scheduleReconnect().
       this.lastConnectionOpenAt = Date.now();
+      this.currentConnectionOpenAt = this.lastConnectionOpenAt;
 
       // Connection is up: the slot did its job, hand it to the next in line.
       this.freeReconnectSlot();
@@ -1075,11 +1094,14 @@ export class BaileysStartupService extends ChannelStartupService {
       return;
     }
 
-    // Reset attempt counter if the previous connection stayed up long enough
+    // Reset attempt counter if the connection that just ended stayed up long enough.
+    // Its 'open' is consumed here: the next attempt only resets the counters if it
+    // reaches 'open' itself and stays there.
     if (this.stayedUpLongEnoughToReset()) {
       this.reconnectAttempts = 0;
       this.consecutiveBadSessionCloses = 0;
     }
+    this.currentConnectionOpenAt = undefined;
 
     const backoffTarget = Math.min(
       BaileysStartupService.RECONNECT_BACKOFF_BASE_MS * 2 ** this.reconnectAttempts,
@@ -1182,6 +1204,93 @@ export class BaileysStartupService extends ChannelStartupService {
     this.releaseReconnectSlot = release;
   };
 
+  /**
+   * O logger do Baileys desta instancia (`logs/<instancia>/baileys-logs.log`): um so por
+   * instancia, reaproveitado entre reconexoes.
+   *
+   * Antes, cada `createClient()` criava um logger com `transport: pino/file`. Cada transport
+   * do pino sobe uma worker thread (isolate V8 proprio + SharedArrayBuffer de 4 MB, ~10 MB
+   * no total) que so morre quando o GC recolhe o logger antigo, e abre o arquivo DENTRO
+   * dela — esse fd nunca era fechado, nem quando a worker morria. Medido em 26/10/2026: 153
+   * workers e 3,5 GB de RSS num servidor da frota depois de um loop de reconexao numa conta
+   * so (127 delas nascidas em 10 minutos), e 22 a 31 mil fds abertos por processo em todos
+   * os servidores.
+   * `pino.destination` e o mesmo sonic-boom que o `pino/file` rodava dentro da worker: mesmo
+   * arquivo, mesmo formato, sem a thread.
+   *
+   * A cada tentativa o arquivo e reaberto (o `reopen` fecha o fd anterior): se a pasta de
+   * logs for apagada com a instancia viva, ela volta na proxima reconexao, como voltava
+   * quando cada tentativa abria o seu.
+   */
+  private getBaileysLogger(): P.Logger {
+    this.baileysLogErrorReported = false;
+
+    if (this.baileysLogDestination) {
+      try {
+        this.baileysLogDestination.reopen();
+        return this.baileysLogger;
+      } catch (error) {
+        // Destino inutilizavel (destruido): abrir um novo. Log e diagnostico, nao pode
+        // impedir a reconexao.
+        this.logger.warn({ message: 'Baileys log reopen failed, opening a new one', error: error?.message });
+        this.baileysLogDestination = undefined;
+      }
+    }
+
+    const destination = P.destination({
+      dest: `./logs/${this.instance.name}/baileys-logs.log`,
+      mkdir: true,
+      sync: false,
+      // Quando a escrita falha (disco cheio), o sonic-boom guarda na RAM o que nao gravou e
+      // tenta de novo a cada linha. Sem teto isso cresce ate o OOM e leva todas as instancias
+      // do servidor junto. Com o teto, ao encher ele descarta as linhas novas (evento 'drop')
+      // e PARA de tentar: so volta a gravar no proximo `reopen`, ou seja, na proxima
+      // reconexao. Uma instancia estavel fica sem log ate reconectar, mesmo com o disco ja
+      // liberado — aceitavel para log de diagnostico.
+      maxLength: BaileysStartupService.BAILEYS_LOG_MAX_BUFFER,
+    });
+    // Sem listener, o pino reemite como 'error' sem dono qualquer falha que nao seja EPIPE
+    // (disco cheio, permissao) e isso vira uncaughtException. Registra so o primeiro erro de
+    // cada abertura: com o disco cheio toda linha falharia de novo, e o primeiro chega
+    // duplicado (o filterBrokenPipe do pino se remove e o reemite dentro do mesmo emit).
+    destination.on('error', (error) => {
+      if (this.baileysLogErrorReported) return;
+      this.baileysLogErrorReported = true;
+      this.logger.error({
+        message: 'Baileys log file error — lines kept in RAM up to the cap, then dropped until the next reconnect',
+        instanceName: this.instance.name,
+        error: error?.message,
+      });
+    });
+    this.baileysLogDestination = destination;
+
+    // O socket que esta sendo substituido pode continuar logando por alguns instantes, e
+    // depois de `closeInstanceLog()` o sonic-boom LANCA em qualquer write ("SonicBoom
+    // destroyed"). Um throw dentro de um handler do Baileys aborta o handler — e um ack que
+    // nao sai derruba o stream. Por isso o logger escreve por esta indirecao, que vira no-op
+    // quando o destino e fechado.
+    this.baileysLogger ??= P(
+      { level: this.logBaileys },
+      { write: (line: string) => this.baileysLogDestination?.write(line) },
+    );
+
+    return this.baileysLogger;
+  }
+
+  /**
+   * Fecha o baileys-logs.log desta instancia. Chamado quando ela sai do registro — nao
+   * pode lancar, ou o `delete` do registro logo depois nao acontece.
+   */
+  public closeInstanceLog = (): void => {
+    const destination = this.baileysLogDestination;
+    this.baileysLogDestination = undefined;
+    try {
+      destination?.end();
+    } catch {
+      // ja destruido: o fd ja foi fechado
+    }
+  };
+
   private async createClient(number?: string): Promise<WASocket> {
     if (this.client) {
       try {
@@ -1277,20 +1386,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
-    const fs = await import('fs');
-
-    fs.mkdirSync(`./logs/${this.instance.name}`, { recursive: true });
-
-    const baileysLogger = P({
-      level: this.logBaileys,
-      transport: {
-        target: 'pino/file',
-        options: {
-          destination: `./logs/${this.instance.name}/baileys-logs.log`,
-          mkdir: true,
-        },
-      },
-    });
+    const baileysLogger = this.getBaileysLogger();
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,
