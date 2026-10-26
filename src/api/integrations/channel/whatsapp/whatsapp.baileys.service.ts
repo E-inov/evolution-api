@@ -255,6 +255,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+  // One Baileys logger per instance, reused across reconnects — see getBaileysLogger().
+  private baileysLogDestination?: ReturnType<typeof P.destination>;
+  private baileysLogger?: P.Logger;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
   // Reconnection control — prevents parallel reconnect timers from piling up
@@ -1182,6 +1185,75 @@ export class BaileysStartupService extends ChannelStartupService {
     this.releaseReconnectSlot = release;
   };
 
+  /**
+   * O logger do Baileys desta instancia (`logs/<instancia>/baileys-logs.log`): um so por
+   * instancia, reaproveitado entre reconexoes.
+   *
+   * Antes, cada `createClient()` criava um logger com `transport: pino/file`. Cada transport
+   * do pino sobe uma worker thread (isolate V8 proprio + SharedArrayBuffer de 4 MB, ~10 MB
+   * no total) que so morre quando o GC recolhe o logger antigo, e abre o arquivo DENTRO
+   * dela — esse fd nunca era fechado, nem quando a worker morria. Medido em 26/10/2026: 153
+   * workers e 3,5 GB de RSS no wa-2 depois de um loop de reconexao numa conta so (127 delas
+   * nascidas em 10 minutos), e 22 a 31 mil fds abertos por processo nos 4 hosts.
+   * `pino.destination` e o mesmo sonic-boom que o `pino/file` rodava dentro da worker: mesmo
+   * arquivo, mesmo formato, sem a thread.
+   *
+   * A cada tentativa o arquivo e reaberto (o `reopen` fecha o fd anterior): se a pasta de
+   * logs for apagada com a instancia viva, ela volta na proxima reconexao, como voltava
+   * quando cada tentativa abria o seu.
+   */
+  private getBaileysLogger(): P.Logger {
+    if (this.baileysLogDestination) {
+      try {
+        this.baileysLogDestination.reopen();
+        return this.baileysLogger;
+      } catch (error) {
+        // Destino inutilizavel (destruido): abrir um novo. Log e diagnostico, nao pode
+        // impedir a reconexao.
+        this.logger.warn({ message: 'Baileys log reopen failed, opening a new one', error: error?.message });
+        this.baileysLogDestination = undefined;
+      }
+    }
+
+    const destination = P.destination({
+      dest: `./logs/${this.instance.name}/baileys-logs.log`,
+      mkdir: true,
+      sync: false,
+    });
+    // Sem listener, o pino reemite como 'error' sem dono qualquer falha que nao seja EPIPE
+    // (disco cheio, permissao) e isso vira uncaughtException.
+    destination.on('error', (error) => {
+      this.logger.error({ message: 'Baileys log file error', instanceName: this.instance.name, error: error?.message });
+    });
+    this.baileysLogDestination = destination;
+
+    // O socket que esta sendo substituido pode continuar logando por alguns instantes, e
+    // depois de `closeInstanceLog()` o sonic-boom LANCA em qualquer write ("SonicBoom
+    // destroyed"). Um throw dentro de um handler do Baileys aborta o handler — e um ack que
+    // nao sai derruba o stream. Por isso o logger escreve por esta indirecao, que vira no-op
+    // quando o destino e fechado.
+    this.baileysLogger ??= P(
+      { level: this.logBaileys },
+      { write: (line: string) => this.baileysLogDestination?.write(line) },
+    );
+
+    return this.baileysLogger;
+  }
+
+  /**
+   * Fecha o baileys-logs.log desta instancia. Chamado quando ela sai do registro — nao
+   * pode lancar, ou o `delete` do registro logo depois nao acontece.
+   */
+  public closeInstanceLog = (): void => {
+    const destination = this.baileysLogDestination;
+    this.baileysLogDestination = undefined;
+    try {
+      destination?.end();
+    } catch {
+      // ja destruido: o fd ja foi fechado
+    }
+  };
+
   private async createClient(number?: string): Promise<WASocket> {
     if (this.client) {
       try {
@@ -1277,20 +1349,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
-    const fs = await import('fs');
-
-    fs.mkdirSync(`./logs/${this.instance.name}`, { recursive: true });
-
-    const baileysLogger = P({
-      level: this.logBaileys,
-      transport: {
-        target: 'pino/file',
-        options: {
-          destination: `./logs/${this.instance.name}/baileys-logs.log`,
-          mkdir: true,
-        },
-      },
-    });
+    const baileysLogger = this.getBaileysLogger();
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,

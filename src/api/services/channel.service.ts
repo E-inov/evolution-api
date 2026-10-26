@@ -50,6 +50,13 @@ export class ChannelStartupService {
    */
   public getLiveSignals?: () => wa.LiveSignals;
 
+  /**
+   * Implemented by channels that keep a per-instance log file open (Baileys):
+   * closes it when the instance leaves the registry, so a removed instance does
+   * not hold a file descriptor for the life of the process.
+   */
+  public closeInstanceLog?: () => void;
+
   public readonly instance: wa.Instance = {};
   public readonly localChatwoot: wa.LocalChatwoot = {};
   public readonly localProxy: wa.LocalProxy = {};

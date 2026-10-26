@@ -500,6 +500,7 @@ export class WAMonitoringService {
       }
 
       try {
+        this.waInstances[instanceName]?.closeInstanceLog?.();
         delete this.waInstances[instanceName];
       } catch (error) {
         this.logger.error(error);
